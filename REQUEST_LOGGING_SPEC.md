@@ -793,7 +793,7 @@ changing it would corrupt real client-facing output, not just the log.
 | TTFT | `first_token_ts - arrival_time` (or vLLM's own derivation, see below) | same |
 | prefill/generation duration | derivable from `scheduled_ts`/`first_token_ts`/`last_token_ts` | same |
 | already-derived footer fields | `build_per_request_timing_metrics()` → `PerRequestTimingMetrics` (`ttft_ms`, `generation_time_ms`, `queue_time_ms`, `mean_itl_ms`, `tokens_per_second`) | `entrypoints/generate/base/serving.py:46-96`, requires `log_stats` (default on: `disable_log_stats: bool = False`, `engine/arg_utils.py:540`) — **prefer computing footer fields directly from `RequestOutput.metrics` per chunk** rather than this helper, since the helper is only invoked once per request (`serving.py:1082` non-streaming, `:783-792` streaming) whereas the log writer needs it incrementally |
-| `cached_tokens` (prefix reuse) | `RequestOutput.num_cached_tokens` | `outputs.py:105,124,147` — present on **every** chunk, not just first; chat serving.py reads it only on `first_iteration` (`:493`) since it's stable after prefill, but nothing stops reading it every chunk |
+| `cached_tokens` (prefix reuse) | `RequestOutput.num_cached_tokens` | `outputs.py:105,124,147` — present on **every** chunk, not just first; chat serving.py reads it only on `first_iteration` (`:493`) since it's stable after prefill, but nothing stops reading it every chunk. **Per-request only** — feeds the footer's `Cached tokens : N (NN.N%)` row as `this_request.num_cached_tokens / this_request.prompt_tokens`, mirroring CachyLlama's `slot.n_prompt_tokens_cache` (Part 3). Do **not** wire vLLM's own built-in periodic `LoggingStatLogger` "Prefix cache hit rate" line into this field — that's a separate, engine-wide rolling-window aggregate across all requests, already existing/unrelated to this feature, and not scoped to any single request the way this footer row needs to be. |
 | cumulative vs delta text | `CompletionOutput.text`/`.token_ids` — delta under `RequestOutputKind.DELTA` (streaming default), cumulative under `CUMULATIVE` (see above), single-and-complete under `FINAL_ONLY` (vanilla non-streaming, before this patch) | `outputs.py:22-48`, enum at `sampling_params.py:182-188` |
 | count of other requests running | `self.engine_client.output_processor.get_num_unfinished_requests()` — plain `len(dict)`, synchronous, no round-trip, `AsyncLLM`-specific (not on the abstract `EngineClient`) | `v1/engine/output_processor.py:449-450`, `AsyncLLM.output_processor` at `v1/engine/async_llm.py:141` — **only valid in-process with `--api-server-count 1`**; with more API server processes each has its own `AsyncLLM`/`output_processor` and would only see its own share, so this field should be omitted (not faked) if this ever runs with `API_SERVERS>1` |
 | HTTP headers / client addr / raw body | `raw_request: Request` (Starlette) — already threaded into `create_chat_completion`/`_create_chat_completion` (`chat_completion/serving.py:219-233,235-`) and `create_completion` (`completion/serving.py:113-`); `raw_request.headers`, `raw_request.client.host`, `await raw_request.body()` (safe to call again post-validation — Starlette caches it) | same |
@@ -1018,3 +1018,447 @@ longer exists in 0.27.1).
   assume holds forever.
 - **Retention**: Part 1 default is no auto-pruning, operator manages disk
   manually — same recommendation here, no changes needed to adopt it.
+
+---
+
+## Part 5 — Engine activity narrator (iteration-detail logging with request IDs)
+
+A second, separate feature, requested alongside Part 4: unlike Parts 1-4
+(one file per request, opt-in, full transcripts), this one writes into the
+server's **normal stdout/console log** — the same stream the systemd unit's
+`StandardOutput=append:%h/qwen-serving/qwen.log` already captures — so an
+operator watching the log live can see what the engine is doing right now
+("what's eating CPU/GPU cycles"), especially when requests overlap.
+
+### It's mostly already built into stock vLLM
+
+`--enable-logging-iteration-details` (`engine/arg_utils.py:1450`,
+`ObservabilityConfig.enable_logging_iteration_details`,
+`config/observability.py:73`, default `False`) already makes the engine log
+one line per step:
+
+```
+Engine 000: Iteration(42): 3 context requests, 6144 context tokens, 0 generation requests, 0 generation tokens, iteration elapsed time: 187.32 ms, GPU KV cache usage: 41.2%
+```
+
+This already has everything Part 1's spec would ask for in an engine-level
+(as opposed to per-request) narrator:
+
+- **Prefill vs. decode split, correctly, including chunked prefill.**
+  `compute_iteration_details()` (`v1/utils.py:808-843`) walks
+  `SchedulerOutput.num_scheduled_tokens` (`v1/core/sched/output.py:193`) and
+  classifies each request via `scheduled_cached_reqs.is_context_phase(req_id)`
+  (or membership in `scheduled_new_reqs`) — the same
+  `num_computed_tokens` vs. `num_prompt_tokens` comparison
+  (`v1/request.py:140-188`) that drives scheduling itself, so a single
+  request's prefill spanning multiple 2048-token steps
+  (`--max-num-batched-tokens 2048`, this repo's setting) shows up as repeated
+  "context" entries across steps until it crosses into decode — exactly the
+  boundary the user cares about.
+- **Real per-step wall-clock timing, already captured.**
+  `capture_iteration_details()` (`v1/engine/core.py:510-559`) wraps the
+  actual model-execution call with `time.monotonic()` before/after and sets
+  `iteration_details.elapsed_ms` — no new timer needed.
+- **Zero cross-process concern.** Despite `EngineCore` itself running in a
+  separate OS process (`EngineCoreProc`, `v1/engine/core.py:1008`, spawned at
+  `v1/engine/utils.py:210`), the actual logging call
+  (`_log_iteration_details()`, `v1/metrics/loggers.py:166-192`, invoked from
+  `LoggingStatLogger.record()`, `:199`) runs in `AsyncLLM.output_handler`
+  (`v1/engine/async_llm.py:717`) — the same **API-server process** `vllm
+  serve`/systemd runs directly. Same stdout, same `qwen.log`, no plumbing
+  needed, same as the existing "Running: X reqs, Waiting: Y reqs" line this
+  repo's README already references.
+- **A real toggle already exists**, satisfying "should be togglable" with
+  zero patching for the toggle itself.
+- **No conflict with this repo's config**: like Part 1's per-request-metrics
+  note, this requires `log_stats` to stay enabled
+  (`disable_log_stats: bool`, off by default) — `single-user/start_qwen.sh`
+  never sets `--disable-log-stats`, so no interaction to worry about.
+
+### The one gap: request IDs, not just counts
+
+The user's requested format names the actual requests
+(`[reqid-1, reqid-2, reqid-3]`), not just a count ("3 context requests").
+Stock vLLM's `_log_iteration_details()` only has counts + totals because
+`compute_iteration_details()` aggregates immediately rather than keeping the
+id list. Closing this is a small, additive patch, **reusing vLLM's existing
+toggle** (no second flag):
+
+1. **`SchedulerIterationDetails`** (`v1/metrics/stats.py:171`) — add
+   `context_req_ids: list[str]` and `generation_req_ids: list[str]` fields
+   alongside the existing `num_context_reqs`/`num_generation_reqs` counts.
+2. **`compute_iteration_details()`** (`v1/utils.py:808-843`) — populate the
+   new fields from the same `scheduled_new_reqs`/`scheduled_cached_reqs`
+   iteration it already does for the counts (no new data source, just don't
+   throw the ids away).
+3. **`_log_iteration_details()`** (`v1/metrics/loggers.py:166-192`) —
+   reformat the message to the two-clause, human-readable shape the user
+   asked for, e.g.:
+
+   ```
+   Engine 000: Iteration(42): prefilling [req-a1b2, req-c3d4, req-e5f6] (3*2048 tokens) | decoding [] | took 187.32 ms, KV cache 41.2%
+   ```
+
+   Token counts stay per-request-group totals (`3*2048` reads as "3 requests
+   at 2048 tokens each" when uniform; fall back to a comma list of individual
+   counts when request token counts differ within a group — check this
+   during implementation, don't silently mislabel a non-uniform batch as
+   uniform).
+
+Ship as `patches/iteration-details-reqids.patch`, same `patch -p1 -d
+venv/lib/python3.12/site-packages/vllm` convention as every other patch in
+this repo, picked up automatically by `verify.sh`'s existing loop — no
+changes needed there either.
+
+### Timing: don't trust `elapsed_ms` under `--async-scheduling`
+
+Live-tested against the running single-user server (which passes
+`--async-scheduling`, `single-user/start_qwen.sh`): the stock line reports
+things like `4 generation tokens, iteration elapsed time: 0.05 ms` — a
+implied ~80,000 tok/s against a real, benchmarked ~114 tok/s. Root cause,
+confirmed by reading the actual dispatch path, not guessed:
+
+- `EngineCore.step()` (`v1/engine/core.py:584-608`) calls
+  `self.model_executor.execute_model(scheduler_output, non_block=True)`
+  **before** `capture_iteration_details()`'s `time.monotonic()` timer opens
+  (`core.py:552`) — the timer only wraps the subsequent `future.result()`
+  call.
+- Under async scheduling, the worker's real GPU output-copy work happens on
+  a **separate background thread**
+  (`async_output_copy_thread`/`async_output_busy_loop`,
+  `v1/executor/multiproc_executor.py:648-658`, spawned only when
+  `use_async_scheduling`) that overlaps with the *next* step's dispatch. By
+  the time `future.result()` runs, the result is often already sitting
+  ready — so the timer measures "queue drain wait," not "compute time for
+  this step." This is async scheduling working as intended (overlapping
+  CPU dispatch latency with GPU compute across steps); the iteration-details
+  timer just predates this mode and was never updated for it. Grepped for
+  any acknowledgment of this near either flag's implementation — none
+  exists; this is an undocumented gap in vLLM itself, not a config mistake
+  on this repo's part.
+
+**The fix**: don't use `capture_iteration_details()`'s `elapsed_ms` for the
+throughput figure at all. Use `engine_core_timestamp` instead — a real
+per-event wall-clock timestamp already threaded through
+`IterationStats.update_from_output()` (`v1/metrics/stats.py:377-421`) into
+`RequestStateStats.first_token_ts`/`last_token_ts` (`:229-230`), which is
+the actual data source behind vLLM's own Prometheus ITL/TTFT numbers and
+therefore behind this repo's own documented, benchmark-verified throughput
+table — i.e. reuse the clock this repo already trusts, don't invent a new
+one. Two ways to apply it, in preference order:
+
+1. **Preferred**: if `engine_core_timestamp` (or the per-step aggregate it
+   derives from) is reachable at the same call site where
+   `compute_iteration_details()` runs, use `this_step_timestamp -
+   last_step_timestamp` as the window and `tokens_this_step / window` as
+   the rate — same clock, no new assumptions. **Must verify at
+   implementation time**: confirm this timestamp is actually available in
+   that scope (it's populated in the same per-step output-processing flow,
+   but the exact call graph connecting the two wasn't traced end-to-end
+   during research).
+2. **Fallback, if (1) isn't cleanly reachable**: timestamp each
+   `_log_iteration_details()` call with `time.monotonic()`, diff against
+   the previous call's timestamp, divide accumulated token counts by that.
+   This sidesteps the async-scheduling dispatch-timing bug by measuring
+   real wall-clock time between log emissions rather than trusting
+   `elapsed_ms` — reasonable because the driver loop's log-emission cadence
+   is still ultimately gated by real step throughput. **Flagged risk, must
+   verify**: if async scheduling uses a batch-queue depth >1 (there are
+   references to a `step_with_batch_queue`-style path — not fully
+   traced), several already-ready results could be drained in a fast burst
+   followed by a gap, making consecutive log-line wall-clock diffs noisier
+   than true per-step cadence. If that shows up in testing, average over a
+   short rolling window (last 3-5 log lines) rather than a raw
+   line-to-line diff.
+
+Either way, the "iteration elapsed time: N.NN ms" field from stock vLLM is
+**dropped from the reformatted line**, not kept alongside the new number —
+showing both the misleading raw figure and a corrected one in the same line
+invites exactly the confusion this whole feature exists to remove.
+
+### Reformatted line
+
+Combining the request-ID patch (previous section) with the corrected
+timing source, and dropping zero-valued clauses instead of always printing
+"0 context requests, 0 context tokens":
+
+```
+Engine 000: prompt processing [req-a1b2, req-c3d4] (2 reqs, 4096 tokens) = 3792.3 tok/s | KV cache 41.2%
+Engine 000: generation [req-e5f6] (1 req, 4 tokens) = 75.7 tok/s | KV cache 7.0%
+Engine 000: prompt processing [req-a1b2] (1 req, 2048 tokens) = 3801.1 tok/s | generation [req-c3d4, req-e5f6] (2 reqs, 8 tokens) = 71.2 tok/s | KV cache 39.8%
+```
+
+(third line: a step that mixes new prefill with ongoing decode for other
+requests — both clauses on one line, only the ones with nonzero work
+shown.)
+
+### Expected volume — read before enabling by default
+
+This logs **every engine step**, not just prefill boundaries. At this repo's
+single-user throughput (continuous batching, `--async-scheduling`), a
+steady decode run can produce on the order of tens of log lines per second
+while actively generating — not just a line at the start/end of a batch.
+This matches what was asked for ("continuously shows the actual work being
+done"), but is a real volume increase to `qwen.log` compared to today; it is
+not building a coarser aggregate that only fires on batch-composition
+changes (deliberately not doing that — see "must verify" below for why).
+
+### Config
+
+Per the user's decision: wired as a knob in `single-user/start_qwen.sh`, env
+var `ITERATION_LOG` (default `0`/off), following the existing
+`CTX`/`MAX_SEQS`/`DRAFT_TOKENS`-style pattern already in that script — when
+set to `1`, adds `--enable-logging-iteration-details` to the `vllm serve`
+invocation. Not enabled on the currently-running server as part of this
+change (per the user's answer); takes effect on next restart. Add a row to
+`single-user/README.md`'s Knobs table.
+
+### Must verify before considering this done
+
+- Confirm the reformatted line still appears exactly once per step under
+  `--api-server-count 1` (this repo's setting in both modes) — the
+  `StatLoggerManager` fan-out (`v1/metrics/loggers.py:1375-1387`) iterates
+  multiple stat loggers; make sure the new fields don't get logged twice by
+  some other already-enabled logger path.
+- Confirm behavior with MTP speculative decoding on (this repo's
+  single-user default): a decode/verify step schedules `k+1` tokens per
+  request via `scheduled_spec_decode_tokens` (`SchedulerOutput`) — decide
+  whether the "decoding" token count in the new line should show accepted
+  tokens, scheduled/proposed tokens, or both, and make sure it's labeled
+  clearly enough that a non-expert reader (per the user's stated unfamiliarity
+  with vLLM internals) doesn't misread speculative token counts as guaranteed
+  output.
+- Sanity-check the per-second volume live against a real generation run
+  before treating `ITERATION_LOG=1` as something to leave on routinely,
+  since it was deliberately built as an uncapped per-step narrator rather
+  than a throttled summary (see "Expected volume" above) — this is a
+  decision to revisit with real numbers, not to assume is fine.
+
+### Relationship to Part 4
+
+Fully independent: different log target (stdout/journal vs. per-request
+files), different toggle (`ITERATION_LOG` vs. `REQUEST_LOG_DIR`), different
+patch file. Both follow the same repo convention (`patches/*.patch` +
+`verify.sh`), so they compose without touching each other.
+
+---
+
+## Part 6 — Per-request lifecycle lines (arrival + completion) in the console log
+
+A third addition, this one genuinely coupled to Part 4 rather than
+independent of it: two one-line console/`qwen.log` entries per request,
+using the **same request ID** as Part 4's per-request disk-log filename, so
+a human can grep one and jump straight to the other.
+
+### Request ID: single canonical value, confirmed — no drift risk
+
+`request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"`
+(`chat_completion/serving.py:258-259`); `_base_request_id`
+(`entrypoints/serve/engine/serving.py:117-126`) returns the client-supplied
+`X-Request-Id` header if present, else `random_uuid()` — exactly Part 1's
+file-naming spec (client header if present, else generated). This one local
+variable is passed explicitly into both `chat_completion_stream_generator(...,
+request_id, ...)` (line 426) and `chat_completion_full_generator(...,
+request_id, ...)` (line 848) — the same value at both the arrival hook and
+the completion hook, and the same value Part 4 already uses for the on-disk
+filename. **One caveat**: when a request expands to multiple prompts
+(`n>1`/batch), each gets `sub_request_id = f"{request_id}_{i}"`
+(line 283-284) — lifecycle lines fire per sub-request, matching how Part 4
+already has to handle that case; not a new problem this part introduces.
+
+### Arrival line
+
+```
+New request req-a1b2: 81659 tokens, 87.4% cached, 7832 new prompt tokens
+```
+
+Per the user's decision: emitted as **one combined line**, fired once the
+first `RequestOutput`/chunk actually comes back from
+`engine_client.generate()` — not at the literal HTTP-arrival instant.
+This is a deliberate, confirmed tradeoff, not an oversight:
+`req_state.num_cached_tokens` is initialized to `0` at `RequestState`
+construction (`v1/engine/output_processor.py:174`, i.e. genuinely at
+arrival) and is only populated later, from
+`engine_core_output.prefill_stats.num_cached_tokens`
+(`output_processor.py:643-647`), gated on the first real `EngineCoreOutput`
+coming back — i.e. after actual scheduling + KV-cache block-matching. A
+line fired at the literal arrival instant cannot honestly include cache%;
+waiting for the first chunk is the earliest point it's honestly available.
+At this repo's `MAX_SEQS=8`, this delay is negligible in the common case;
+it only becomes a real, visible gap if the server is genuinely saturated
+and the request sits in the wait queue — which is itself useful
+information (a delayed arrival line during heavy load is a legitimate
+signal, not a bug).
+
+Hook point: same as Part 4's `write_header` site — no new hook.
+
+### Completion line
+
+```
+Request req-a1b2 finished: 73827 PP (3263.37 tok/s), 389 generated (173.7 tok/s)
+```
+
+Two things worth getting right rather than assuming from the user's example
+verbatim:
+
+- **PP tok/s should be computed over newly-processed (non-cached) prompt
+  tokens, not the raw prompt length** — i.e. `(prompt_tokens -
+  cached_tokens) / prefill_duration`, not `prompt_tokens / prefill_duration`.
+  Counting cached tokens toward "tokens processed per second" would inflate
+  the number past what the GPU actually did (cached tokens require no
+  computation), and would be inconsistent with how this repo's own README
+  benchmark tables define "Prefill speed (PP)" elsewhere. If a request has
+  a high cache hit rate, expect the PP-tok/s figure to look unusually high
+  relative to typical numbers precisely because there was little real work
+  — that's correct, not a bug, but worth a comment in the code so a future
+  reader isn't confused by an outlier.
+- **`prefill_duration` should exclude queue-wait**, matching Part 1's
+  existing distinction between `Prefill duration` (total) and `Actual
+  prefill duration` (only if measurable, i.e. excluding queue wait) — reuse
+  `RequestStateStats.first_token_ts - scheduled_ts` (not `- arrival_time`,
+  which would fold queue-wait into the rate and understate it) if
+  `scheduled_ts` is cleanly available at this hook point; fall back to
+  `first_token_ts - arrival_time` with the caveat noted in the line itself
+  if not. **Must verify** which is actually reachable at the `write_footer`
+  hook site at implementation time.
+- Both `(last_token_ts - first_token_ts)` for generation duration and
+  `(first_token_ts - arrival_time)`/`scheduled_ts` for prefill duration
+  come from the same `engine_core_timestamp` family Part 5 already
+  validated as trustworthy for aggregated (not single-step) durations —
+  confirmed again here: `RequestStateStats` (`v1/metrics/stats.py:218-230`)
+  documents `arrival_time` as "an engine frontend timestamp (wall-clock)"
+  and `queued_ts`/`scheduled_ts`/`first_token_ts`/`last_token_ts` as "engine
+  core timestamps (monotonic)", set via `EngineCoreOutputs.timestamp`
+  (`v1/engine/__init__.py:257-258`, `time.monotonic()` at construction in
+  `EngineCore.step()`, `core.py:573`) — the same site Part 5 found to be
+  skewed for *single-step* latency under async scheduling, but safe here
+  because these deltas are aggregated over the whole request (many steps),
+  where any per-step pipelining skew is a small, bounded offset that washes
+  out — exactly why this same data source already backs this repo's
+  accurate, benchmark-verified throughput numbers.
+
+Hook point: same as Part 4's `write_footer` site (end of
+`chat_completion_full_generator`/`chat_completion_stream_generator`) — no
+new hook.
+
+### Config
+
+Tied to `REQUEST_LOG_DIR` (Part 4's toggle), not a separate flag: these
+lines are two lightweight, per-request entries (not Part 5's per-step
+volume concern) derived from data Part 4's writer already computes whenever
+it's enabled — if you want the per-request disk logs, you get these
+console lifecycle lines for free at the same hook points, no extra
+plumbing. If per-request disk logging is ever wanted off while keeping just
+these two console lines, that's a small follow-up (split the toggle), not
+something to build speculatively now.
+
+### Relationship to Parts 4 and 5
+
+Reuses Part 4's request ID, writer data, and hook points entirely (this is
+essentially "Part 4's writer also calls `logger.info(...)` twice"), and
+shares Part 5's validated timestamp source for the completion line's rates.
+Does not touch Part 5's per-step narrator or its `ITERATION_LOG` toggle.
+
+---
+
+## Part 7 — Prompt cache-boundary marker in the per-request log
+
+A fourth addition, scoped entirely inside Part 4's per-request disk log:
+show where in the prompt the prefix-cache hit ends and real prefill
+computation begins, as a marker in the log file.
+
+### Why this can't just be spliced into the existing pretty `PROMPT` section
+
+`num_cached_tokens` is a **token index** into the raw, chat-template-expanded
+sequence actually fed to the model — not a character offset into Part 1's
+hand-formatted `SYSTEM:`/`USER:`/`ASSISTANT:`/`TOOL:` rendering (which adds
+role labels, reformats attachments, and doesn't include template control
+tokens like `<|im_start|>`). Those two texts aren't 1:1, so an accurate
+marker needs the *raw* tokenizer-decoded text, not the pretty one.
+
+### Data access — confirmed, same scope as everything else in Part 4
+
+- `tokenizer = self.renderer.tokenizer` (`chat_completion/serving.py:241`).
+- `prompt_token_ids = self._extract_prompt_components(engine_input).token_ids`
+  (`chat_completion/serving.py:278`, `TokensInput.prompt_token_ids`,
+  `vllm/inputs/engine.py:37`) — the exact sequence `num_cached_tokens`
+  indexes into. Both already in scope at the same point Part 4's
+  `write_header` hook fires; no new plumbing.
+
+### Precision limits — state these plainly, don't imply more than they give
+
+- **Block-quantized, always.** vLLM's prefix cache only matches whole
+  KV-cache blocks (`KVCacheManager.get_computed_blocks()`,
+  `v1/core/kv_cache_manager.py:229`, docstring: "the computed blocks must be
+  full" — partial-block matches never happen). `num_cached_tokens` is
+  therefore always a multiple of the block size: 16 by default
+  (`config/cache.py:52`, `DEFAULT_BLOCK_SIZE`; confirmed this repo's
+  `CTX=fast`/`CTX=long` never override it) or 128 for `CTX=huge`/KVarN
+  (`--block-size 128`, per the main README). The marker lands on that grid,
+  not at the exact conceptual content boundary — expect it a few tokens
+  before or after where a human would intuitively "feel" the cut is, more so
+  at `CTX=huge`. State the block size and both raw counts in the log line
+  itself (see format below) so this isn't a silent surprise.
+- **Decode the full sequence once and split it — don't decode two slices
+  and concatenate.** `tokenizer.decode(ids[:N])` +
+  `tokenizer.decode(ids[N:])` joined separately is not guaranteed to equal
+  `tokenizer.decode(ids)` — BPE/SentencePiece tokenizers commonly encode a
+  leading-space marker as part of the token right after a cut, so decoding
+  it in isolation vs. in its original context can render whitespace
+  differently exactly at the boundary. Correct approach: `full_text =
+  tokenizer.decode(prompt_token_ids)`, `cached_text =
+  tokenizer.decode(prompt_token_ids[:num_cached_tokens])`, verify
+  `full_text.startswith(cached_text)`, then split `full_text` at
+  `len(cached_text)` and insert the marker there — one canonical decode,
+  not two joined fragments. Fall back to the naive
+  decode-and-concatenate only if the `startswith` check fails (accepting a
+  possible stray-space cosmetic artifact right at the cut in that rare
+  case), and log a note in the file when the fallback path was taken so
+  it's visible rather than silent.
+- No offset-returning decode API exists in this tokenizer interface
+  (`TokenizerLike.decode()`, `tokenizers/protocol.py:120-123`, plain
+  string out) — the `startswith`-and-split approach above is the practical
+  substitute, not a missing feature to work around further.
+
+### Format — per the user's decision
+
+Keeps Part 1's existing pretty `=== PROMPT ===` section completely
+untouched (no risk to the already-speced, working rendering). Adds a new,
+separate, clearly-labeled section directly after it, showing a short window
+of raw tokenizer text around the cut (not the full raw prompt — just enough
+to anchor "here's what was actually cached vs. not"):
+
+```
+=== PROMPT ===
+SYSTEM: You are a helpful assistant.
+USER: I'm working on the quarterly report and I need you to help me clean
+up the formatting in section 3, specifically the revenue table...
+
+=== CACHE BOUNDARY (raw tokenizer text, not the rendering above) ===
+7168 cached / 1274 new (block-aligned, block size 16)
+...need you to
+<--- CACHED UNTIL HERE. PREPROCESSING FROM HERE --->
+ help me clean up the formatting...
+```
+
+Window size (how much raw text before/after the marker): default ~80
+characters each side, enough to recognize the surrounding content without
+dumping the entire raw prompt a second time. Omit this section entirely
+when `cached_tokens == 0` (nothing to mark) — same "omit, don't fake"
+discipline as everything else in this spec.
+
+### Hook point / config
+
+Computed at the same point Part 4's `write_header` fires (raw
+`prompt_token_ids` and `num_cached_tokens` are both already needed there
+for the performance footer's cached-tokens row — Part 4, `outputs.py:105`).
+Tied to `REQUEST_LOG_DIR` like the rest of Part 4/6 — not a separate
+toggle; this is one more thing the same writer emits when per-request
+logging is on.
+
+### Relationship to Parts 4/6
+
+Purely additive to Part 4's per-request file — same writer, same hook
+point, same toggle. Independent of Parts 5/6's console-line features
+(different log target entirely: this writes into the per-request disk
+file, not `qwen.log`).
