@@ -185,6 +185,18 @@ if [ -z "$VLLM_API_KEY" ] && [ -f "$REPO/api_key.txt" ]; then
   export VLLM_API_KEY="$(cat "$REPO/api_key.txt")"
 fi
 
+# patches/request-logging.patch imports request_logging.py from the repo
+# root (it's not vendored into vllm/) — always needed, not just when
+# REQUEST_LOG_DIR is set, since the patch imports it unconditionally at
+# module load time (degrades to a silent no-op without this, doesn't crash).
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+# REQUEST_LOG_DIR: unset (default) = per-request disk logging off. Set to a
+# directory (e.g. REQUEST_LOG_DIR=$REPO/qwen.log.d/requests) to enable full
+# request/response logging — see REQUEST_LOGGING_SPEC.md.
+if [ -n "$REQUEST_LOG_DIR" ]; then
+  export REQUEST_LOG_DIR
+fi
+
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
   --host 0.0.0.0 --port $PORT \

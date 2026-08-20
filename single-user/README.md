@@ -363,6 +363,7 @@ Point your chat client at `http://<host>:18020/v1` with the key from
 | `GPU_UTIL` | 0.93 | soak-tested with a 100k prompt and 4×6k-token generations; batch mode's 0.972 OOMs in the MTP path (docs/gotchas.md, gotcha 4) |
 | `MTP_DRAFT_VOCAB` | 1 | set 0 to draft with the full lm_head (more acceptance, slower per draft) |
 | `PORT` | 18020 | |
+| `REQUEST_LOG_DIR` | unset (off) | set to a directory to write one human-readable log file per request (full prompt/response, incremental, plus a performance footer) — see `REQUEST_LOGGING_SPEC.md` |
 
 ## Switching modes
 

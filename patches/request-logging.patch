@@ -1,0 +1,579 @@
+Per-request disk logging: one human-readable log file per inference
+request under REQUEST_LOG_DIR (unset = feature off entirely), containing
+the full request, the response written incrementally as it's generated
+(so a hung/cancelled/errored request still leaves a trace), and a
+performance footer. See REQUEST_LOGGING_SPEC.md (Part 1 for the format,
+Part 4 for this port's design/hook points) and request_logging.py (repo
+root, standalone — not vendored into this package) for the writer itself.
+
+Both entrypoints get the same shape: gather HTTP-level context once, open
+a log file per sub-request, force non-streaming requests onto
+RequestOutputKind.CUMULATIVE so the engine actually produces intermediate
+RequestOutputs to tap (FINAL_ONLY otherwise yields nothing until the
+request is fully done or dead), tap the streaming/non-streaming result
+generators for incremental writes, and finalize the log (performance
+footer / error block / best-effort partial-footer on cancellation) via
+try/except/else/finally around the existing generator loops.
+
+Needs the repo root on PYTHONPATH to import request_logging (see
+single-user/start_qwen.sh); degrades to a silent no-op (not a crash) if
+it isn't, since the import is wrapped in try/except ImportError.
+
+Apply from the installed vllm package directory:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/request-logging.patch
+
+Written against vLLM 0.27.1. Reapply after upgrades.
+--- a/entrypoints/openai/chat_completion/serving.py	2026-08-20 07:44:47.139003451 +0000
++++ b/entrypoints/openai/chat_completion/serving.py	2026-08-20 07:53:24.091707277 +0000
+@@ -61,10 +61,79 @@
+ from vllm.parser import ParserManager
+ from vllm.parser.abstract_parser import Parser
+ from vllm.renderers.online_renderer import OnlineRenderer
+-from vllm.sampling_params import BeamSearchParams, SamplingParams
++from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils.collection_utils import as_list
+ 
++# --- request-logging (REQUEST_LOG_DIR) -------------------------------------
++# Standalone module at the repo root, not vendored into this package — see
++# REQUEST_LOGGING_SPEC.md Part 4. Imported defensively: if the repo root
++# isn't on PYTHONPATH (see single-user/start_qwen.sh), request logging is
++# just unavailable rather than crashing the whole server at import time.
++try:
++    import request_logging as _request_logging
++except ImportError:
++    _request_logging = None
++
++
++class _NoOpLogWriter:
++    def write_header(self, **kwargs):
++        pass
++
++    def write_chunk(self, text):
++        pass
++
++    def note_progress(self, **kwargs):
++        pass
++
++    def write_footer(self, **kwargs):
++        pass
++
++    def write_error(self, exc, **kwargs):
++        pass
++
++    def close(self):
++        pass
++
++
++def _get_request_log_writer(request_id: str, prompt_text: str):
++    if _request_logging is None:
++        return _NoOpLogWriter()
++    return _request_logging.get_request_log_writer(request_id, prompt_text)
++
++
++def _num_unfinished_requests(engine_client) -> int | None:
++    output_processor = getattr(engine_client, "output_processor", None)
++    if output_processor is None:
++        return None
++    try:
++        return output_processor.get_num_unfinished_requests()
++    except Exception:
++        return None
++
++
++def _concurrency_at_arrival(engine_client) -> int | None:
++    """Other requests in flight at header-write time — called before
++    ``self.engine_client.generate(...)`` is even invoked, and even once
++    invoked an async generator's body doesn't run (so the request isn't
++    registered with the output processor) until first iterated. So the raw
++    count here already excludes this request; no adjustment needed. Only
++    valid in-process with --api-server-count 1 (see REQUEST_LOGGING_SPEC.md
++    Part 4 data-mapping table).
++    """
++    return _num_unfinished_requests(engine_client)
++
++
++def _concurrency_during(engine_client) -> int | None:
++    """Other requests in flight once this request is itself mid-stream —
++    called from inside the ``async for res in result_generator`` loop,
++    where receiving any `res` at all proves this request is already
++    registered, so the raw count includes it. Subtract 1 to get "other".
++    """
++    n = _num_unfinished_requests(engine_client)
++    return None if n is None else max(n - 1, 0)
++
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -267,6 +336,24 @@
+ 
+         model_name = self.models.model_name(lora_request)
+ 
++        # request-logging (REQUEST_LOG_DIR): gathered once per HTTP request,
++        # not per sub-request below — same underlying HTTP request for all
++        # of them. See REQUEST_LOGGING_SPEC.md Part 4 hook 1.
++        log_prompt_text = (
++            _request_logging.render_chat_transcript(conversation)
++            if _request_logging is not None
++            else ""
++        )
++        log_client_addr = (
++            raw_request.client.host if raw_request and raw_request.client else None
++        )
++        log_method = raw_request.method if raw_request else "POST"
++        log_path = raw_request.url.path if raw_request else "/v1/chat/completions"
++        log_headers = dict(raw_request.headers) if raw_request else {}
++        log_raw_body = (
++            (await raw_request.body()).decode("utf-8", "replace") if raw_request else ""
++        )
++
+         # Extract data_parallel_rank from header (router can inject it)
+         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+ 
+@@ -306,6 +393,20 @@
+                     self.default_sampling_params,
+                 )
+ 
++            # request-logging (REQUEST_LOG_DIR): non-streaming requests
++            # otherwise never produce an intermediate RequestOutput
++            # (RequestOutputKind.FINAL_ONLY short-circuits the output
++            # processor) — CUMULATIVE gives us per-chunk visibility for the
++            # log without changing what the final response contains, since
++            # under CUMULATIVE each yielded output's text already *is* the
++            # complete text so far. See REQUEST_LOGGING_SPEC.md Part 4 "The
++            # key difference from CachyLlama". Streaming is left untouched:
++            # its own delta-accumulation logic assumes DELTA and is part of
++            # the SSE contract the client depends on.
++            log_writer = _get_request_log_writer(sub_request_id, log_prompt_text)
++            if isinstance(sampling_params, SamplingParams) and not request.stream:
++                sampling_params.output_kind = RequestOutputKind.CUMULATIVE
++
+             self._log_inputs(
+                 sub_request_id,
+                 engine_input,
+@@ -340,6 +441,28 @@
+                 else:
+                     reasoning_ended = None
+ 
++                # request-logging (REQUEST_LOG_DIR): reasoning_ended is
++                # False exactly when the chat template forced the prompt
++                # into an open "<think>" that the model itself never
++                # (re-)generates — synthesize that opener in the log too.
++                # See REQUEST_LOGGING_SPEC.md "Reasoning-model <think>
++                # prefix".
++                log_writer.write_header(
++                    request_id=sub_request_id,
++                    client_addr=log_client_addr,
++                    method=log_method,
++                    path=log_path,
++                    model=request.model,
++                    resolved_model=model_name,
++                    headers=log_headers,
++                    sampling_params=sampling_params,
++                    model_settings=self.default_sampling_params,
++                    raw_body=log_raw_body,
++                    prompt_text=log_prompt_text,
++                    thinking_forced_open=reasoning_ended is False,
++                    concurrent_at_arrival=_concurrency_at_arrival(self.engine_client),
++                )
++
+                 generator = self.engine_client.generate(
+                     engine_input,
+                     sampling_params,
+@@ -372,6 +495,7 @@
+                 request_metadata,
+                 chat_template_kwargs=chat_template_kwargs,
+                 mm_token_counts=mm_token_counts,
++                log_writer=log_writer,
+             )
+ 
+         return await self.chat_completion_full_generator(
+@@ -384,6 +508,7 @@
+             request_metadata,
+             parser=parser,
+             mm_token_counts=mm_token_counts,
++            log_writer=log_writer,
+         )
+ 
+     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
+@@ -430,10 +555,14 @@
+         request_metadata: RequestResponseMetadata,
+         chat_template_kwargs: dict[str, Any] | None = None,
+         mm_token_counts: dict[str, int] | None = None,
++        log_writer=None,
+     ) -> AsyncGenerator[str, None]:
++        if log_writer is None:
++            log_writer = _NoOpLogWriter()
+         created_time = int(time.time())
+         chunk_object_type: Final = "chat.completion.chunk"
+         first_iteration = True
++        log_completion_tokens = 0
+ 
+         # Send response for each token for each request.n (index)
+         num_choices = 1 if request.n is None else request.n
+@@ -470,6 +599,8 @@
+                 parsers = [None] * num_choices
+         except Exception as e:
+             logger.exception("Error in parser creation.")
++            log_writer.write_error(e)
++            log_writer.close()
+             data = self.create_streaming_error_response(e)
+             yield f"data: {data}\n\n"
+             yield "data: [DONE]\n\n"
+@@ -601,6 +732,23 @@
+ 
+                     delta_text = output.text
+ 
++                    # request-logging (REQUEST_LOG_DIR): log the raw delta
++                    # (before parser.parse_delta() below strips/reshapes it
++                    # for the client) — the log is not a protocol payload,
++                    # see REQUEST_LOGGING_SPEC.md "Reasoning-model <think>
++                    # prefix". Only the primary choice (index 0) is logged;
++                    # this repo's single-user setup doesn't use request.n>1.
++                    if i == 0:
++                        log_writer.write_chunk(delta_text)
++                        log_completion_tokens += len(output.token_ids)
++                        log_writer.note_progress(
++                            prompt_tokens=num_prompt_tokens or None,
++                            completion_tokens=log_completion_tokens or None,
++                            cached_tokens=res.num_cached_tokens,
++                            metrics=res.metrics,
++                            concurrency_snapshot=_concurrency_during(self.engine_client),
++                        )
++
+                     if (
+                         not delta_text
+                         and not output.token_ids
+@@ -833,11 +981,27 @@
+                     )
+ 
+         except GenerationError as e:
++            log_writer.write_error(e)
+             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
+         except Exception as e:
+             logger.exception("Error in chat completion stream generator.")
++            log_writer.write_error(e)
+             data = self.create_streaming_error_response(e)
+             yield f"data: {data}\n\n"
++        else:
++            log_writer.write_footer()
++        finally:
++            # request-logging (REQUEST_LOG_DIR): runs on normal completion,
++            # on a caught GenerationError/Exception (both handled above,
++            # this call is then a no-op since already finalized), AND on
++            # client disconnect/cancellation — this method has no
++            # `except asyncio.CancelledError`, so without this `finally` a
++            # disconnect mid-stream would silently drop the log entry
++            # entirely. See REQUEST_LOGGING_SPEC.md Part 1 gotcha #1 / Part
++            # 4 hook 3. close() itself writes a best-effort "=== CANCELLED
++            # ===" block with whatever partial data was tracked when
++            # reached without a prior write_footer()/write_error().
++            log_writer.close()
+         # Send the final done message after all response.n are finished
+         yield "data: [DONE]\n\n"
+ 
+@@ -852,23 +1016,54 @@
+         request_metadata: RequestResponseMetadata,
+         parser: Parser | None = None,
+         mm_token_counts: dict[str, int] | None = None,
++        log_writer=None,
+     ) -> ErrorResponse | ChatCompletionResponse:
++        if log_writer is None:
++            log_writer = _NoOpLogWriter()
+         created_time = int(time.time())
+         final_res: RequestOutput | None = None
+ 
++        # request-logging (REQUEST_LOG_DIR): non-streaming requests are
++        # forced onto RequestOutputKind.CUMULATIVE when a writer is active
++        # (see the CUMULATIVE-override comment in _create_chat_completion),
++        # so `res` here already carries the complete text/token_ids so far
++        # on every iteration, not a delta — track how much has already been
++        # written to the log so each chunk logs only the new suffix. This
++        # loop's own accumulation (`final_res = res`) is untouched and stays
++        # correct exactly because CUMULATIVE means the last `res` is the
++        # complete response, verified against the actual HTTP response in
++        # REQUEST_LOGGING_SPEC.md Part 4's testing section.
++        log_offset = 0
+         try:
+             async for res in result_generator:
+                 final_res = res
++                if res.outputs:
++                    log_writer.note_progress(
++                        prompt_tokens=len(res.prompt_token_ids) if res.prompt_token_ids else None,
++                        completion_tokens=len(res.outputs[0].token_ids) or None,
++                        cached_tokens=res.num_cached_tokens,
++                        metrics=res.metrics,
++                        concurrency_snapshot=_concurrency_during(self.engine_client),
++                    )
++                    full_text = res.outputs[0].text
++                    if len(full_text) > log_offset:
++                        log_writer.write_chunk(full_text[log_offset:])
++                        log_offset = len(full_text)
+         except asyncio.CancelledError:
++            log_writer.write_error(asyncio.CancelledError("Client disconnected"))
++            log_writer.close()
+             return self.create_error_response("Client disconnected")
+ 
+         if final_res is None:
++            log_writer.close()
+             return self.create_error_response(
+                 "No output received from the engine.",
+                 err_type="InternalServerError",
+                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+             )
+ 
++        log_writer.write_footer()
++
+         choices: list[ChatCompletionResponseChoice] = []
+ 
+         role = self.get_chat_request_role(request)
+--- a/entrypoints/openai/completion/serving.py	2026-08-20 07:44:47.140003439 +0000
++++ b/entrypoints/openai/completion/serving.py	2026-08-20 07:53:40.417507414 +0000
+@@ -44,11 +44,80 @@
+ from vllm.logprobs import Logprob
+ from vllm.outputs import RequestOutput
+ from vllm.renderers.online_renderer import OnlineRenderer
+-from vllm.sampling_params import BeamSearchParams, SamplingParams
++from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils.async_utils import merge_async_iterators
+ from vllm.utils.collection_utils import as_list
+ 
++# --- request-logging (REQUEST_LOG_DIR) -------------------------------------
++# Standalone module at the repo root, not vendored into this package — see
++# REQUEST_LOGGING_SPEC.md Part 4. Imported defensively: if the repo root
++# isn't on PYTHONPATH (see single-user/start_qwen.sh), request logging is
++# just unavailable rather than crashing the whole server at import time.
++try:
++    import request_logging as _request_logging
++except ImportError:
++    _request_logging = None
++
++
++class _NoOpLogWriter:
++    def write_header(self, **kwargs):
++        pass
++
++    def write_chunk(self, text):
++        pass
++
++    def note_progress(self, **kwargs):
++        pass
++
++    def write_footer(self, **kwargs):
++        pass
++
++    def write_error(self, exc, **kwargs):
++        pass
++
++    def close(self):
++        pass
++
++
++def _get_request_log_writer(request_id: str, prompt_text: str):
++    if _request_logging is None:
++        return _NoOpLogWriter()
++    return _request_logging.get_request_log_writer(request_id, prompt_text)
++
++
++def _num_unfinished_requests(engine_client) -> int | None:
++    output_processor = getattr(engine_client, "output_processor", None)
++    if output_processor is None:
++        return None
++    try:
++        return output_processor.get_num_unfinished_requests()
++    except Exception:
++        return None
++
++
++def _concurrency_at_arrival(engine_client) -> int | None:
++    """Other requests in flight at header-write time — called before
++    ``self.engine_client.generate(...)`` is even invoked, and even once
++    invoked an async generator's body doesn't run (so the request isn't
++    registered with the output processor) until first iterated. So the raw
++    count here already excludes this request; no adjustment needed. Only
++    valid in-process with --api-server-count 1 (see REQUEST_LOGGING_SPEC.md
++    Part 4 data-mapping table).
++    """
++    return _num_unfinished_requests(engine_client)
++
++
++def _concurrency_during(engine_client) -> int | None:
++    """Other requests in flight once this request is itself mid-stream —
++    called from inside the merged ``(prompt_idx, res)`` iteration, where
++    receiving any `res` at all proves this request is already registered,
++    so the raw count includes it. Subtract 1 to get "other".
++    """
++    n = _num_unfinished_requests(engine_client)
++    return None if n is None else max(n - 1, 0)
++
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -156,6 +225,21 @@
+         # Extract data_parallel_rank from header (router can inject it)
+         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+ 
++        # request-logging (REQUEST_LOG_DIR): gathered once per HTTP request —
++        # same underlying HTTP request for every prompt in a batch `prompt`
++        # array below. See REQUEST_LOGGING_SPEC.md Part 4 hook 1.
++        log_resolved_model = self.models.model_name(lora_request)
++        log_client_addr = (
++            raw_request.client.host if raw_request and raw_request.client else None
++        )
++        log_method = raw_request.method if raw_request else "POST"
++        log_path = raw_request.url.path if raw_request else "/v1/completions"
++        log_headers = dict(raw_request.headers) if raw_request else {}
++        log_raw_body = (
++            (await raw_request.body()).decode("utf-8", "replace") if raw_request else ""
++        )
++        log_writers: list = []
++
+         # Schedule the request and get the result generator.
+         max_model_len = self.model_config.max_model_len
+         generators: list[AsyncGenerator[RequestOutput, None]] = []
+@@ -195,6 +279,32 @@
+                 else await self._get_trace_headers(raw_request.headers)
+             )
+ 
++            # request-logging (REQUEST_LOG_DIR): same CUMULATIVE-override
++            # reasoning as the chat endpoint — see _create_chat_completion.
++            # One writer per prompt in this request's `prompt` array (batch
++            # completions can carry several); request_id_item matches the
++            # id this._log_inputs() above already uses for the same prompt.
++            log_prompt_text = self._extract_prompt_text(engine_input) or ""
++            log_writer = _get_request_log_writer(request_id_item, log_prompt_text)
++            if isinstance(sampling_params, SamplingParams) and not request.stream:
++                sampling_params.output_kind = RequestOutputKind.CUMULATIVE
++            log_writer.write_header(
++                request_id=request_id_item,
++                client_addr=log_client_addr,
++                method=log_method,
++                path=log_path,
++                model=request.model,
++                resolved_model=log_resolved_model,
++                headers=log_headers,
++                sampling_params=sampling_params,
++                model_settings=self.default_sampling_params,
++                raw_body=log_raw_body,
++                prompt_text=log_prompt_text,
++                thinking_forced_open=False,
++                concurrent_at_arrival=_concurrency_at_arrival(self.engine_client),
++            )
++            log_writers.append(log_writer)
++
+             if isinstance(sampling_params, BeamSearchParams):
+                 generator = self.beam_search(
+                     prompt=engine_input,
+@@ -235,13 +345,30 @@
+                 num_prompts=num_prompts,
+                 tokenizer=tokenizer,
+                 request_metadata=request_metadata,
++                log_writers=log_writers,
+             )
+ 
+         # Non-streaming response
+         final_res_batch: list[RequestOutput | None] = [None] * num_prompts
++        # request-logging: per-prompt "already logged up to N chars" offset —
++        # each `res` carries the full CUMULATIVE text so far, see the
++        # CUMULATIVE-override comment above.
++        log_offsets = [0] * num_prompts
+         try:
+             async for i, res in result_generator:
+                 final_res_batch[i] = res
++                if res.outputs:
++                    log_writers[i].note_progress(
++                        prompt_tokens=len(res.prompt_token_ids) if res.prompt_token_ids else None,
++                        completion_tokens=len(res.outputs[0].token_ids) or None,
++                        cached_tokens=res.num_cached_tokens,
++                        metrics=res.metrics,
++                        concurrency_snapshot=_concurrency_during(self.engine_client),
++                    )
++                    full_text = res.outputs[0].text
++                    if len(full_text) > log_offsets[i]:
++                        log_writers[i].write_chunk(full_text[log_offsets[i] :])
++                        log_offsets[i] = len(full_text)
+ 
+             for i, final_res in enumerate(final_res_batch):
+                 assert final_res is not None
+@@ -263,8 +390,16 @@
+                 tokenizer,
+                 request_metadata,
+             )
++            for w in log_writers:
++                w.write_footer()
+         except asyncio.CancelledError:
++            for w in log_writers:
++                w.write_error(asyncio.CancelledError("Client disconnected"))
++                w.close()
+             return self.create_error_response("Client disconnected")
++        finally:
++            for w in log_writers:
++                w.close()
+ 
+         # When user requests streaming but we don't stream, we still need to
+         # return a streaming response with a single event.
+@@ -290,7 +425,11 @@
+         num_prompts: int,
+         tokenizer: TokenizerLike | None,
+         request_metadata: RequestResponseMetadata,
++        log_writers: list | None = None,
+     ) -> AsyncGenerator[str, None]:
++        if log_writers is None:
++            log_writers = [_NoOpLogWriter()] * num_prompts
++        log_completion_tokens = [0] * num_prompts
+         num_choices = 1 if request.n is None else request.n
+         previous_text_lens = [0] * num_choices * num_prompts
+         previous_num_tokens = [0] * num_choices * num_prompts
+@@ -330,6 +469,22 @@
+                 for output in res.outputs:
+                     i = output.index + prompt_idx * num_choices
+ 
++                    # request-logging (REQUEST_LOG_DIR): log the raw
++                    # generated delta only (not the echo-prepended prompt
++                    # text below — the log already has its own PROMPT
++                    # section). Only the primary choice (index 0) per
++                    # prompt is logged, matching the chat endpoint.
++                    if output.index == 0:
++                        log_writers[prompt_idx].write_chunk(output.text)
++                        log_completion_tokens[prompt_idx] += len(output.token_ids)
++                        log_writers[prompt_idx].note_progress(
++                            prompt_tokens=num_prompt_tokens[prompt_idx] or None,
++                            completion_tokens=log_completion_tokens[prompt_idx] or None,
++                            cached_tokens=res.num_cached_tokens,
++                            metrics=res.metrics,
++                            concurrency_snapshot=_concurrency_during(self.engine_client),
++                        )
++
+                     # Useful when request.return_token_ids is True
+                     # Returning prompt token IDs shares the same logic
+                     # with the echo implementation.
+@@ -490,11 +645,26 @@
+             request_metadata.final_usage_info = final_usage_info
+ 
+         except GenerationError as e:
++            for w in log_writers:
++                w.write_error(e)
+             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
+         except Exception as e:
+             logger.exception("Error in completion stream generator.")
++            for w in log_writers:
++                w.write_error(e)
+             data = self.create_streaming_error_response(e)
+             yield f"data: {data}\n\n"
++        else:
++            for w in log_writers:
++                w.write_footer()
++        finally:
++            # request-logging (REQUEST_LOG_DIR): runs on normal completion,
++            # on a caught error (no-op there, already finalized above), and
++            # on client disconnect/cancellation — this method has no
++            # `except asyncio.CancelledError` either, see the identical
++            # comment in chat_completion_stream_generator.
++            for w in log_writers:
++                w.close()
+         yield "data: [DONE]\n\n"
+ 
+     def request_output_to_completion_response(
