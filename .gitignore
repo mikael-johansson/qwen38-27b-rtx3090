@@ -9,3 +9,7 @@ venv/
 drafter/data/
 drafter/runs/
 .env
+# REQUEST_LOG_DIR default (single-user/README.md Knobs table) — full request/
+# response transcripts, sensitive, see REQUEST_LOGGING_SPEC.md. If you point
+# REQUEST_LOG_DIR elsewhere, ignore that path too.
+requests/

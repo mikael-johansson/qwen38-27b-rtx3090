@@ -364,6 +364,7 @@ Point your chat client at `http://<host>:18020/v1` with the key from
 | `MTP_DRAFT_VOCAB` | 1 | set 0 to draft with the full lm_head (more acceptance, slower per draft) |
 | `PORT` | 18020 | |
 | `REQUEST_LOG_DIR` | unset (off) | set to a directory to write one human-readable log file per request (full prompt/response, incremental, plus a performance footer) — see `REQUEST_LOGGING_SPEC.md` |
+| `ITERATION_LOG` | 0 | 1 = log one line per engine step to stdout/qwen.log naming the requests being prefilled/decoded and real (not the misleading stock) tok/s — see `REQUEST_LOGGING_SPEC.md` Part 5 |
 
 ## Switching modes
 

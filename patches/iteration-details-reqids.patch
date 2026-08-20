@@ -1,0 +1,282 @@
+Engine activity narrator: reformats --enable-logging-iteration-details'
+per-step log line to name the actual requests instead of just counts, and
+replaces its elapsed_ms field (unreliable under --async-scheduling, see
+_log_iteration_details()'s docstring below) with a real wall-clock rate
+computed from the gap between log calls. See REQUEST_LOGGING_SPEC.md Part
+5. No new CLI flag: reuses vLLM's existing --enable-logging-iteration-details
+toggle, wired to this repo's ITERATION_LOG env var in start_qwen.sh.
+
+Before:
+  Engine 000: Iteration(42): 3 context requests, 6144 context tokens, 0
+  generation requests, 0 generation tokens, iteration elapsed time: 0.05
+  ms, GPU KV cache usage: 41.2%
+
+After:
+  Engine 000: prompt processing [chatcmpl-a1b2, chatcmpl-c3d4, chatcmpl-e5f6]
+  (3 reqs, 6144 tokens) = 3792.3 tok/s | GPU KV cache usage: 41.2%
+
+Four files, all data already computed and just not threaded through
+before: SchedulerIterationDetails/IterationDetails gain per-request id +
+token-count lists (v1/metrics/stats.py, v1/utils.py) populated in
+compute_iteration_details()'s existing per-request loop (v1/utils.py) and
+copied through in capture_iteration_details() (v1/engine/core.py); the
+reformatting and corrected timing live entirely in
+LoggingStatLogger._log_iteration_details() (v1/metrics/loggers.py) — no
+change to the cross-process wire format's compatibility (verified the new
+list[str]/list[int] fields round-trip through msgspec.msgpack encode/decode
+of EngineCoreOutputs, the actual struct these stats travel inside from the
+EngineCore process to the API server process).
+
+Apply from the installed vllm package directory:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/iteration-details-reqids.patch
+
+Written against vLLM 0.27.1. Reapply after upgrades.
+--- a/v1/metrics/stats.py	2026-08-20 12:20:43.556517598 +0000
++++ b/v1/metrics/stats.py	2026-08-20 12:20:50.180437080 +0000
+@@ -180,6 +180,15 @@
+     num_encoder_inputs: int = 0
+     num_encoder_output_tokens: int = 0
+     is_dummy: bool = False
++    # request-logging (ITERATION_LOG, REQUEST_LOGGING_SPEC.md Part 5): which
++    # requests made up num_ctx_requests/num_generation_requests above, and
++    # how many tokens each contributed — parallel arrays to the id lists,
++    # not just counts, so --enable-logging-iteration-details can name the
++    # actual requests instead of "3 context requests".
++    context_req_ids: list[str] = field(default_factory=list)
++    context_req_tokens: list[int] = field(default_factory=list)
++    generation_req_ids: list[str] = field(default_factory=list)
++    generation_req_tokens: list[int] = field(default_factory=list)
+ 
+ 
+ @dataclass
+--- a/v1/utils.py	2026-08-20 12:20:43.557517586 +0000
++++ b/v1/utils.py	2026-08-20 12:21:21.691054093 +0000
+@@ -9,7 +9,7 @@
+ import weakref
+ from collections.abc import Callable, Sequence
+ from contextlib import AbstractContextManager
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from multiprocessing import connection
+ from multiprocessing.process import BaseProcess
+ from multiprocessing.queues import Queue
+@@ -795,6 +795,11 @@
+     num_generation_tokens: int
+     num_encoder_inputs: int = 0
+     num_encoder_output_tokens: int = 0
++    # request-logging (ITERATION_LOG, REQUEST_LOGGING_SPEC.md Part 5)
++    context_req_ids: list[str] = field(default_factory=list)
++    context_req_tokens: list[int] = field(default_factory=list)
++    generation_req_ids: list[str] = field(default_factory=list)
++    generation_req_tokens: list[int] = field(default_factory=list)
+ 
+     def __repr__(self) -> str:
+         return f"IterationDetails(num_ctx_requests={self.num_ctx_requests},\
+@@ -823,6 +828,13 @@
+     num_context_tokens = 0
+     num_generation_requests = 0
+     num_generation_tokens = 0
++    # request-logging (ITERATION_LOG, REQUEST_LOGGING_SPEC.md Part 5): same
++    # loop that already computes the counts above, just also keeping the ids
++    # instead of throwing them away — no new data source.
++    context_req_ids: list[str] = []
++    context_req_tokens: list[int] = []
++    generation_req_ids: list[str] = []
++    generation_req_tokens: list[int] = []
+     new_req_ids = {new_req.req_id for new_req in scheduler_output.scheduled_new_reqs}
+     for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+         if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id) or (
+@@ -830,9 +842,13 @@
+         ):
+             num_context_requests += 1
+             num_context_tokens += num_tokens
++            context_req_ids.append(req_id)
++            context_req_tokens.append(num_tokens)
+         else:
+             num_generation_requests += 1
+             num_generation_tokens += num_tokens
++            generation_req_ids.append(req_id)
++            generation_req_tokens.append(num_tokens)
+     scheduled_encoder_input_stats = scheduler_output.scheduled_encoder_input_stats
+     num_encoder_inputs = 0
+     num_encoder_output_tokens = 0
+@@ -847,4 +863,8 @@
+         num_generation_tokens,
+         num_encoder_inputs,
+         num_encoder_output_tokens,
++        context_req_ids,
++        context_req_tokens,
++        generation_req_ids,
++        generation_req_tokens,
+     )
+--- a/v1/engine/core.py	2026-08-20 12:20:43.558517574 +0000
++++ b/v1/engine/core.py	2026-08-20 12:21:30.049952507 +0000
+@@ -547,6 +547,10 @@
+                 elapsed_ms=0.0,
+                 num_encoder_inputs=details.num_encoder_inputs,
+                 num_encoder_output_tokens=details.num_encoder_output_tokens,
++                context_req_ids=details.context_req_ids,
++                context_req_tokens=details.context_req_tokens,
++                generation_req_ids=details.generation_req_ids,
++                generation_req_tokens=details.generation_req_tokens,
+             )
+ 
+         start_time = time.monotonic()
+--- a/v1/metrics/loggers.py	2026-08-20 12:20:43.559517562 +0000
++++ b/v1/metrics/loggers.py	2026-08-20 12:23:11.528719601 +0000
+@@ -4,6 +4,7 @@
+ import logging
+ import time
+ from abc import ABC, abstractmethod
++from collections import deque
+ from collections.abc import Callable
+ 
+ from prometheus_client import Counter, Gauge, Histogram
+@@ -41,6 +42,23 @@
+ StatLoggerFactory = AggregateStatLoggerFactory | PerEngineStatLoggerFactory
+ 
+ 
++def _format_iteration_clause(
++    label: str, req_ids: list[str], total_tokens: int, tok_s: float | None
++) -> str:
++    """One clause of an --enable-logging-iteration-details line, e.g.
++    "prompt processing [chatcmpl-a1b2, chatcmpl-c3d4] (2 reqs, 4096 tokens)
++    = 3792.3 tok/s" (REQUEST_LOGGING_SPEC.md Part 5 "Reformatted line").
++    Token count is always the group's total, never a per-request "N*M"
++    shorthand — a non-uniform batch (different requests scheduled different
++    token counts, e.g. mixed chunked-prefill continuations) would make that
++    shorthand actively misleading, and the total is correct either way.
++    """
++    n = len(req_ids)
++    req_word = "req" if n == 1 else "reqs"
++    rate = f" = {tok_s:.1f} tok/s" if tok_s is not None else ""
++    return f"{label} [{', '.join(req_ids)}] ({n} {req_word}, {total_tokens} tokens){rate}"
++
++
+ class StatLoggerBase(ABC):
+     """Interface for logging metrics.
+ 
+@@ -126,6 +144,15 @@
+         self.engine_is_idle = False
+         self.aggregated = False
+ 
++        # request-logging (ITERATION_LOG, REQUEST_LOGGING_SPEC.md Part 5):
++        # real wall-clock timing for _log_iteration_details(), replacing the
++        # SchedulerIterationDetails.elapsed_ms figure (unreliable under
++        # --async-scheduling, see that method's docstring). Rolling window
++        # of the last few (dt, ctx_tokens, gen_tokens) intervals between
++        # consecutive calls, rather than one raw line-to-line diff.
++        self._iter_log_last_ts: float | None = None
++        self._iter_log_intervals: deque[tuple[float, int, int]] = deque(maxlen=5)
++
+         if self._enable_perf_stats():
+             self.perf_metrics_logging = PerfMetricsLogging(vllm_config)
+ 
+@@ -168,32 +195,91 @@
+     def _log_iteration_details(
+         self, scheduler_stats: SchedulerStats, engine_idx: int
+     ) -> None:
++        """--enable-logging-iteration-details, reformatted to name the
++        actual requests instead of just counts (REQUEST_LOGGING_SPEC.md
++        Part 5). Also drops SchedulerIterationDetails.elapsed_ms from the
++        line entirely: it's `time.monotonic()` wrapped only around
++        `future.result()` in EngineCore.step()/step_with_batch_queue(),
++        *after* `model_executor.execute_model(..., non_block=True)` has
++        already been dispatched — under --async-scheduling (this repo's
++        setting), max_concurrent_batches > 1 means execution for this
++        result was typically already dispatched (and often already
++        complete) one or more steps ago, so by the time `.result()` is
++        awaited here the call mostly measures queue-drain wait, not this
++        step's compute time. Confirmed live: a 4-token step reporting
++        ~0.05ms (an implied ~80,000 tok/s against a benchmarked ~114
++        tok/s). Instead, this uses the real wall-clock gap between
++        consecutive calls to this method (which fire once per completed,
++        non-dummy, non-empty engine step, independent of that broken
++        timer), averaged over a short rolling window rather than a single
++        line-to-line diff — draining a multi-slot batch queue can burst
++        several ready results followed by a gap, which would otherwise
++        make individual diffs noisier than true per-step cadence.
++        """
+         details = scheduler_stats.iteration_details
+         if details is None:
+             return
+ 
+-        encoder_msg = ""
++        if details.is_dummy:
++            # DP dummy/padding iteration: no real request work, don't feed
++            # it into the timing window.
++            logger.info(
++                "%s(DP padding iteration, no scheduled work), "
++                "GPU KV cache usage: %.1f%%",
++                self._log_prefix_for_engine(engine_idx),
++                scheduler_stats.kv_cache_usage * 100,
++            )
++            return
++
++        now = time.monotonic()
++        ctx_tok_s: float | None = None
++        gen_tok_s: float | None = None
++        if self._iter_log_last_ts is not None:
++            dt = now - self._iter_log_last_ts
++            if dt > 0:
++                self._iter_log_intervals.append(
++                    (dt, details.num_ctx_tokens, details.num_generation_tokens)
++                )
++                window_dt = sum(d for d, _, _ in self._iter_log_intervals)
++                if window_dt > 0:
++                    ctx_tok_s = (
++                        sum(c for _, c, _ in self._iter_log_intervals) / window_dt
++                    )
++                    gen_tok_s = (
++                        sum(g for _, _, g in self._iter_log_intervals) / window_dt
++                    )
++        self._iter_log_last_ts = now
++
++        clauses = []
++        if details.num_ctx_requests:
++            clauses.append(
++                _format_iteration_clause(
++                    "prompt processing",
++                    details.context_req_ids,
++                    details.num_ctx_tokens,
++                    ctx_tok_s,
++                )
++            )
++        if details.num_generation_requests:
++            clauses.append(
++                _format_iteration_clause(
++                    "generation",
++                    details.generation_req_ids,
++                    details.num_generation_tokens,
++                    gen_tok_s,
++                )
++            )
+         if details.num_encoder_inputs:
+-            encoder_msg = (
+-                f", encoder inputs: {details.num_encoder_inputs}, "
+-                f"encoder output embeddings: {details.num_encoder_output_tokens}"
++            clauses.append(
++                f"encoder [{details.num_encoder_inputs} inputs, "
++                f"{details.num_encoder_output_tokens} output embeddings]"
+             )
+ 
+         logger.info(
+-            "%sIteration(%d): %d context requests, %d context tokens, "
+-            "%d generation requests, %d generation tokens, "
+-            "iteration elapsed time: %.2f ms%s, "
+-            "GPU KV cache usage: %.1f%%%s",
++            "%s%s | GPU KV cache usage: %.1f%%",
+             self._log_prefix_for_engine(engine_idx),
+-            details.iteration_index,
+-            details.num_ctx_requests,
+-            details.num_ctx_tokens,
+-            details.num_generation_requests,
+-            details.num_generation_tokens,
+-            details.elapsed_ms,
+-            " (dummy)" if details.is_dummy else "",
++            " | ".join(clauses) if clauses else "(no scheduled work)",
+             scheduler_stats.kv_cache_usage * 100,
+-            encoder_msg,
+         )
+ 
+     def record(

@@ -168,6 +168,18 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   EXTRA_ARGS="--enable-prefix-caching --mamba-cache-mode align ${EXTRA_ARGS}"
 fi
 
+# ITERATION_LOG=1: log one line per engine step to stdout/qwen.log, naming
+# the actual requests being prefilled/decoded and their real throughput —
+# "what's eating GPU cycles right now", useful when requests overlap. Reuses
+# vLLM's own --enable-logging-iteration-details (patches/iteration-details-
+# reqids.patch adds the request-id + corrected-timing formatting on top).
+# High volume while decoding (a line per step, not just per batch) — see
+# REQUEST_LOGGING_SPEC.md Part 5 "Expected volume" before leaving this on
+# routinely.
+if [ "${ITERATION_LOG:-0}" = "1" ]; then
+  EXTRA_ARGS="--enable-logging-iteration-details ${EXTRA_ARGS}"
+fi
+
 # ASYNC_SCHED=0 (set above for a long DFlash2 verify block) runs the scheduler
 # synchronously, which is the only path on which vLLM lets the worker choose how many draft
 # tokens to put up for verification. Note --async-scheduling is already the default in
