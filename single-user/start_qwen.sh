@@ -186,6 +186,23 @@ fi
 # 0.27.1: --no-async-scheduling is what turns it off.
 ASYNC_ARGS=$([ "${ASYNC_SCHED:-1}" = 1 ] && echo --async-scheduling || echo --no-async-scheduling)
 
+# --kv-offloading-size: vLLM's CPU-offload connector creates a multi-GB
+# mmap file at /dev/shm/vllm_offload_<engine_id>.mmap. patches/offload-
+# cleanup-on-init-failure.patch makes it clean up after itself when its own
+# startup fails, but that's an in-process fix — it structurally cannot help
+# against SIGKILL, an OOM-kill, or a hard crash that skips Python entirely.
+# This is the unconditional backstop: only touches /dev/shm if no vllm
+# server is currently running (so it can never delete a live instance's
+# file), which is also exactly the situation that left one behind.
+if ! pgrep -f "$REPO/venv/bin/vllm serve" > /dev/null 2>&1; then
+  stale_offload_files=$(ls /dev/shm/vllm_offload_*.mmap 2>/dev/null)
+  if [ -n "$stale_offload_files" ]; then
+    echo "start_qwen.sh: removing stale /dev/shm offload file(s) from a previous run (no vllm server currently running):" >&2
+    echo "$stale_offload_files" >&2
+    rm -f /dev/shm/vllm_offload_*.mmap
+  fi
+fi
+
 export PATH="$REPO/venv/bin:$PATH"
 # Overridable: expandable_segments needs CUDA VMM, which WSL2's paravirt
 # driver rejects ("CUDA driver error: device not ready" during Marlin repack)

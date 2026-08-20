@@ -123,7 +123,7 @@ Written against vLLM 0.27.1. Reapply after upgrades.
  
          start_time = time.monotonic()
 --- a/v1/metrics/loggers.py	2026-08-20 12:20:43.559517562 +0000
-+++ b/v1/metrics/loggers.py	2026-08-20 15:07:00.028898367 +0000
++++ b/v1/metrics/loggers.py	2026-08-20 16:10:15.581404075 +0000
 @@ -4,6 +4,7 @@
  import logging
  import time
@@ -329,3 +329,58 @@ Written against vLLM 0.27.1. Reapply after upgrades.
          )
  
      def record(
+@@ -284,25 +419,40 @@
+             log_parts.append("Preemptions: %d")
+             log_args.append(self.num_preemptions)
+ 
+-        log_parts.extend(
+-            [
+-                "GPU KV cache usage: %.1f%%",
+-                "Prefix cache hit rate: %.1f%%",
+-            ]
+-        )
+-        log_args.extend(
+-            [
+-                self.last_scheduler_stats.kv_cache_usage * 100,
+-                self.prefix_caching_metrics.hit_rate * 100,
+-            ]
+-        )
++        log_parts.append("GPU KV cache usage: %.1f%%")
++        log_args.append(self.last_scheduler_stats.kv_cache_usage * 100)
+ 
+         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+             log_parts.append("Corrupted: %d reqs")
+             log_args.append(self.num_corrupted_reqs)
++
++        # request-logging: shortened labels. When an offload/external
++        # connector is active, also report the combined hit rate — but
++        # correctly, not as a naive sum of the two percentages.
++        # prefix_hit_rate is a fraction of *all* prompt tokens;
++        # external_hit_rate is a fraction of only the tokens that missed
++        # the local cache (a different, smaller denominator), so summing
++        # them directly double-counts local's share and overstates the
++        # total. total = local + (1 - local) * external is the correct
++        # combination of two sequential pass/fail stages.
++        prefix_hit_rate = self.prefix_caching_metrics.hit_rate
+         if not self.connector_prefix_caching_metrics.empty:
+-            log_parts.append("External prefix cache hit rate: %.1f%%")
+-            log_args.append(self.connector_prefix_caching_metrics.hit_rate * 100)
++            external_hit_rate = self.connector_prefix_caching_metrics.hit_rate
++            total_hit_rate = prefix_hit_rate + (1 - prefix_hit_rate) * external_hit_rate
++            log_parts.append(
++                "prefix cache hit: %.1f%%, external %.1f%%, total %.1f%%"
++            )
++            log_args.extend(
++                [
++                    prefix_hit_rate * 100,
++                    external_hit_rate * 100,
++                    total_hit_rate * 100,
++                ]
++            )
++        else:
++            log_parts.append("prefix cache hit: %.1f%%")
++            log_args.append(prefix_hit_rate * 100)
++
+         if not self.mm_caching_metrics.empty:
+             log_parts.append("MM cache hit rate: %.1f%%")
+             log_args.append(self.mm_caching_metrics.hit_rate * 100)
