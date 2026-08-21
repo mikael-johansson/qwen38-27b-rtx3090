@@ -1,0 +1,52 @@
+Make the prefix-cache-hit-rate rolling window configurable via
+VLLM_CACHE_METRICS_WINDOW (default 1000, unchanged from upstream's
+hardcoded value -- there's even a "# TODO: Make the interval configurable."
+comment already sitting on this line in vLLM 0.27.1).
+
+Why: the periodic "prefix cache hit: NN%" log line (loggers.py) is a
+sliding-window average over the *last N requests this engine has served*,
+not a per-request number. With the default N=1000, on this single-user
+box that window easily spans an entire day's mixed traffic (this
+conversation's tests, deliberate cold-start benchmarks via
+local_chat_test.py -p, title-generation calls, etc.), so the logged
+percentage rarely reflects what's actually happening in the request you
+just sent. Setting VLLM_CACHE_METRICS_WINDOW=1 (or a small number) makes
+that log line track only the most recent request(s) instead.
+
+Applies to all three CachingMetrics instances LoggingStatLogger creates
+(prefix, connector/external-tier, and multimodal) so the window stays
+consistent across every "X% ... external Y%, total Z%" figure on that
+line.
+
+--- a/v1/metrics/loggers.py
++++ b/v1/metrics/loggers.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import logging
++import os
+ import time
+ from abc import ABC, abstractmethod
+ from collections import deque
+@@ -142,10 +143,17 @@
+         self.last_scheduler_stats = SchedulerStats()
+ 
+         # Caching metrics. This cannot be reset.
+-        # TODO: Make the interval configurable.
+-        self.prefix_caching_metrics = CachingMetrics()
+-        self.connector_prefix_caching_metrics = CachingMetrics()
+-        self.mm_caching_metrics = CachingMetrics()
++        # request-logging: window made configurable via
++        # VLLM_CACHE_METRICS_WINDOW (default 1000, matching upstream's
++        # previous hardcoded value) -- with the default 1000-request
++        # rolling window, the periodic "prefix cache hit: NN%" log line
++        # blends in a lot of unrelated traffic (other sessions, one-off
++        # cold-start tests, etc.), so a small window lets it reflect only
++        # the last few requests instead.
++        _cache_metrics_window = int(os.environ.get("VLLM_CACHE_METRICS_WINDOW", "1000"))
++        self.prefix_caching_metrics = CachingMetrics(_cache_metrics_window)
++        self.connector_prefix_caching_metrics = CachingMetrics(_cache_metrics_window)
++        self.mm_caching_metrics = CachingMetrics(_cache_metrics_window)
+ 
+         model_config = self.vllm_config.model_config
+         is_diffusion = model_config is not None and model_config.is_diffusion

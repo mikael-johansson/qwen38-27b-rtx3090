@@ -143,18 +143,22 @@ def main() -> None:
         default=0,
         metavar="N",
         help=(
-            "Prefill-throughput test mode: prepend a fresh, always-cold "
-            "system prompt (unique timestamp + N filler sentences) to "
-            "every turn instead of a growing conversation, so each request "
-            "measures raw uncached PP tok/s."
+            "Prepend a large system prompt (unique timestamp + N filler "
+            "sentences, so the very first turn is a guaranteed cache miss) "
+            "once at session start. It then stays fixed for the rest of "
+            "the session -- the conversation grows normally on top of it, "
+            "so from the second turn onward it should be served from cache."
         ),
     )
     args = ap.parse_args()
 
     print(f"Connected to {args.url} (model={args.model}). Ctrl-D to quit.\n")
-    if args.prompt_size:
-        print(f"Prompt-processing test mode: {args.prompt_size} filler sentences per turn.\n")
     messages: list[dict] = []
+    if args.prompt_size:
+        messages.append(
+            {"role": "system", "content": build_test_system_prompt(args.prompt_size)}
+        )
+        print(f"Prompt-processing test mode: {args.prompt_size} filler sentences (fixed for this session).\n")
     while True:
         try:
             user_input = input("you> ")
@@ -163,20 +167,10 @@ def main() -> None:
             break
         if not user_input.strip():
             continue
-        if args.prompt_size:
-            # Standalone each turn: a changing system prompt at the front
-            # would poison any accumulated history's cache anyway, so
-            # there's no point carrying it forward.
-            messages = [
-                {"role": "system", "content": build_test_system_prompt(args.prompt_size)},
-                {"role": "user", "content": user_input},
-            ]
-        else:
-            messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "user", "content": user_input})
         print("assistant> ", end="", flush=True)
         reply = stream_chat(args.url, args.model, args.token, messages)
-        if not args.prompt_size:
-            messages.extend(reply)
+        messages.extend(reply)
 
 
 if __name__ == "__main__":
