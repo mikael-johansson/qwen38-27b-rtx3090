@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "vllm": {
+      "class": "vllm.logging_utils.NewLineFormatter",
+      "datefmt": "%m-%d %H:%M:%S",
+      "format": "%(levelname)s %(asctime)s [%(fileinfo)s:%(lineno)d] %(message)s"
+    },
+    "vllm_color": {
+      "class": "vllm.logging_utils.ColoredFormatter",
+      "datefmt": "%m-%d %H:%M:%S",
+      "format": "%(levelname)s %(asctime)s [%(fileinfo)s:%(lineno)d] %(message)s"
+    }
+  },
+  "handlers": {
+    "vllm_console": {
+      "class": "logging.StreamHandler",
+      "formatter": "vllm_color",
+      "level": "INFO",
+      "stream": "ext://sys.stdout"
+    },
+    "vllm_file": {
+      "class": "logging.handlers.RotatingFileHandler",
+      "formatter": "vllm",
+      "level": "INFO",
+      "filename": "qwen.log",
+      "maxBytes": 209715200,
+      "backupCount": 5,
+      "encoding": "utf-8"
+    }
+  },
+  "loggers": {
+    "vllm": {
+      "handlers": ["vllm_console", "vllm_file"],
+      "level": "INFO",
+      "propagate": false
+    }
+  }
+}
