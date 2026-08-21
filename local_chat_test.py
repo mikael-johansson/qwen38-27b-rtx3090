@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import json
 import os
 import time
@@ -20,6 +21,26 @@ import urllib.request
 DEFAULT_URL = "http://127.0.0.1:18020"
 DEFAULT_MODEL = "qwen3.8-27b"
 DEFAULT_TOKEN = "88ff2b4ed74b68c225b49457f501d0e4cebd06f59d581e2e"
+
+LOREM_SENTENCE = (
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do "
+    "eiusmod tempor incididunt ut labore et dolore magna aliqua."
+)
+
+
+def build_test_system_prompt(n: int) -> str:
+    """A system prompt guaranteed to miss the prefix cache every time
+    (the timestamp changes every call), followed by N filler sentences so
+    the size is controllable for prefill-throughput testing.
+    """
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    preamble = (
+        f"This is a prompt processing test started {now}. A lot of filler "
+        "will now arrive. You do not need to act on it, it is only there "
+        "to test prompt processing."
+    )
+    filler = " ".join([LOREM_SENTENCE] * n)
+    return f"{preamble}\n\n{filler}"
 
 
 def stream_chat(url: str, model: str, token: str, messages: list[dict]) -> list[dict]:
@@ -115,9 +136,24 @@ def main() -> None:
     ap.add_argument("--url", default=os.environ.get("VLLM_URL", DEFAULT_URL))
     ap.add_argument("--model", default=os.environ.get("VLLM_MODEL", DEFAULT_MODEL))
     ap.add_argument("--token", default=os.environ.get("VLLM_TOKEN", DEFAULT_TOKEN))
+    ap.add_argument(
+        "-p",
+        "--prompt-size",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Prefill-throughput test mode: prepend a fresh, always-cold "
+            "system prompt (unique timestamp + N filler sentences) to "
+            "every turn instead of a growing conversation, so each request "
+            "measures raw uncached PP tok/s."
+        ),
+    )
     args = ap.parse_args()
 
     print(f"Connected to {args.url} (model={args.model}). Ctrl-D to quit.\n")
+    if args.prompt_size:
+        print(f"Prompt-processing test mode: {args.prompt_size} filler sentences per turn.\n")
     messages: list[dict] = []
     while True:
         try:
@@ -127,10 +163,20 @@ def main() -> None:
             break
         if not user_input.strip():
             continue
-        messages.append({"role": "user", "content": user_input})
+        if args.prompt_size:
+            # Standalone each turn: a changing system prompt at the front
+            # would poison any accumulated history's cache anyway, so
+            # there's no point carrying it forward.
+            messages = [
+                {"role": "system", "content": build_test_system_prompt(args.prompt_size)},
+                {"role": "user", "content": user_input},
+            ]
+        else:
+            messages.append({"role": "user", "content": user_input})
         print("assistant> ", end="", flush=True)
         reply = stream_chat(args.url, args.model, args.token, messages)
-        messages.extend(reply)
+        if not args.prompt_size:
+            messages.extend(reply)
 
 
 if __name__ == "__main__":
