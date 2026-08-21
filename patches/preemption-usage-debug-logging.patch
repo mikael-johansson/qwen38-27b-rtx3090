@@ -1,0 +1,51 @@
+More debug logging (no behavior change) for the same investigation:
+requires patches/preemption-offload-debug-logging.patch applied first
+(same file, block_pool.py).
+
+Follow-up to a direct question: why does a *single*, unopposed ~88K-token
+prompt self-preempt at all -- shouldn't it either fit start-to-finish, or
+never finish? Traced the solo-repro's actual numbers: at self-preemption
+it had processed 71,552 tokens but reported 97.8% GPU KV cache usage --
+raw math (71,552 / 171,956 pool) predicts only ~41.6%. After the
+preemption-defer-block-free fix's flush-and-retry, the SAME content (69,888
+tokens, more than before) needed only 47.1%, roughly matching raw math.
+Something other than this request's own token count was consuming ~56%
+of the pool during the uninterrupted first attempt, and that overhead
+disappeared after preemption.
+
+get_usage() in block_pool.py computes purely from block counts
+(1 - free_blocks/total_blocks) -- no ref-counting or offload-cascade
+logic anywhere in it, so whatever explains the discrepancy has to show
+up as a raw block-count gap. This logs total_blocks/free_blocks/used_blocks
+whenever usage exceeds 0.5, to see the actual numbers behind the
+percentage during a repro run.
+
+--- a/v1/core/block_pool.py
++++ b/v1/core/block_pool.py
+@@ -825,7 +825,25 @@
+         total_gpu_blocks = self.num_gpu_blocks - 1
+         if not total_gpu_blocks:
+             return 0
+-        return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
++        free_blocks = self.get_num_free_blocks()
++        usage = 1.0 - (free_blocks / total_gpu_blocks)
++        # request-logging preemption-debug: raw block accounting, to check
++        # whether "GPU KV cache usage" tracks raw token count or something
++        # else is consuming blocks. See 2026-08-21 conversation.
++        if usage > 0.5:
++            used_blocks = total_gpu_blocks - free_blocks
++            logger.debug(
++                "request-logging preemption-debug: get_usage() total_blocks=%d "
++                "free_blocks=%d used_blocks=%d usage=%.4f hash_block_size=%d "
++                "used_blocks_as_tokens=%d",
++                total_gpu_blocks,
++                free_blocks,
++                used_blocks,
++                usage,
++                self.hash_block_size,
++                used_blocks * self.hash_block_size,
++            )
++        return usage
+ 
+     def take_events(self) -> list[KVCacheEvent]:
+         """Atomically takes all events and clears the queue.
