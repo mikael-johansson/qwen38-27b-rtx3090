@@ -33,3 +33,17 @@ bash single-user/start_qwen.sh
 # debug: ..." trace lines land in qwen.log; console handler stays INFO so
 # the terminal isn't flooded with every debug line in vLLM. Switch back to
 # logging-to-file.json once this investigation is done.
+#
+# --watermark: tried at 0.35 and REVERTED (2026-08-21). Tested against a
+# single unopposed ~88K-token prompt (the second request correctly parked
+# in queue, qwait=74.7s, never raced it) -- and the first one *still* took
+# 433.89s (vs 435.955s without watermark), self-preempting 3 times purely
+# on its own. watermark applies the same headroom check to a request's own
+# PREEMPTED-status retry as it does to a genuinely new competing request
+# (kv_cache_manager.py can't tell them apart), so for a single prompt this
+# size (~88K, roughly half the ~172K pool) the watermark reserve competes
+# with the request's own resumption instead of only blocking a rival. Net:
+# the original "two requests racing" framing was incomplete -- a single
+# request this size self-preempts repeatedly even with zero contention, so
+# admission-control against a second request was never the fix for the
+# bulk of the observed latency. See 2026-08-21 conversation.
