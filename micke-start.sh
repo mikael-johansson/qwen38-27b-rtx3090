@@ -6,13 +6,16 @@ VLLM_CACHE_METRICS_WINDOW=3 \
 PREFIX_CACHE=1 \
 CTX=long \
 MAX_LEN=140000 \
-VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file.json \
-EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":25769803776,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv"}]}} --enable-cumem-allocator' \
+VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file-debug.json \
+EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv"}]}} --enable-cumem-allocator' \
 bash single-user/start_qwen.sh
 # kv-transfer-config above replaces --kv-offloading-size, with cpu_bytes_to_use
-# raised from 12GB to 24GB (host has 32GB total; ~5GB non-offload baseline
-# measured directly, so 24GB offload leaves ~3-4GB free for the OS -- accepted
-# tradeoff, see 2026-08-21 conversation), plus a "fs" secondary tier so blocks
+# at 20GB (host has 32GB total; ~5GB non-offload baseline measured directly).
+# Was 24GB literal, but that measured baseline undercounted real-world
+# pressure -- two concurrent ~88K-token prompts pushed vLLM's own processes
+# into swap at 24GB (verified via /proc/<pid>/status VmSwap), so backed off
+# by 4GB for a firmer safety margin -- accepted tradeoff, see 2026-08-21
+# conversation), plus a "fs" secondary tier so blocks
 # evicted from RAM cascade to NVMe (/d/nvme_cache/vllm_kv, 194GB free) instead
 # of being lost. The JSON has NO
 # spaces deliberately -- EXTRA_ARGS is expanded unquoted in start_qwen.sh,
@@ -22,3 +25,11 @@ bash single-user/start_qwen.sh
 # kv_connector is supplied explicitly (unlike --kv-offloading-size's default
 # path, which sets kv_connector via attribute assignment after construction
 # and so never triggers that validator) -- confirmed by direct testing.
+#
+# VLLM_LOGGING_CONFIG_PATH -> logging-to-file-debug.json (not the normal
+# logging-to-file.json): temporary, for the preemption/offload-cascade
+# investigation (patches/preemption-offload-debug-logging.patch). File
+# handler + "vllm" logger at DEBUG so the "request-logging preemption-
+# debug: ..." trace lines land in qwen.log; console handler stays INFO so
+# the terminal isn't flooded with every debug line in vLLM. Switch back to
+# logging-to-file.json once this investigation is done.
