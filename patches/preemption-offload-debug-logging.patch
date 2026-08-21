@@ -1,0 +1,140 @@
+Debug logging (no behavior change) to empirically confirm/refute the
+preemption-vs-offload-cascade race hypothesis from the 2026-08-21
+conversation: a request preempted mid-prefill (before ever completing a
+full turn) recomputes from scratch on retry -- Cached tokens: 0 (0.0%),
+zero kv_offload_load activity -- even though the same offload tier
+demonstrably restores multi-GB of KV cache correctly for requests that
+finished normally and were evicted/resumed later (verified: real
+kv_offload_load_bytes events, ~250ms for ~3GB, exactly matching
+conversation-switch timestamps).
+
+vLLM already has a purpose-built mechanism for this: a preempted
+request's in-flight offload store jobs are supposed to be synchronously
+flushed before its blocks can be reused (jobs_to_flush, built in
+offloading/scheduler.py's build_connector_meta() and waited on in
+offloading/worker.py's handle_preemptions()). Whether that flush
+actually completes before the scheduler's own block-free
+(_free_request_blocks() -> block_pool.py's free_blocks(), which only
+returns a block to the reusable/cacheable pool once its ref_cnt reaches
+exactly 0) is the open question -- this patch adds logger.debug() calls
+at every step of that path so a live repro shows the actual order of
+events:
+
+  1. v1/core/sched/scheduler.py: _free_request_blocks() logs which path
+     (immediate vs deferred) is taken for a preempted request, and the
+     last_sched_seq/processed_step_seq values that decide it.
+  2. v1/core/block_pool.py: free_blocks() logs any block whose ref_cnt
+     doesn't reach 0 after decrementing -- the direct signal that
+     something else (e.g. an in-flight offload cascade) still holds it.
+  3. offloading/scheduler.py: build_connector_meta() logs when/whether
+     jobs_to_flush actually gets populated for a preempted request.
+  4. offloading/worker.py: handle_preemptions() logs before/after the
+     synchronous wait() on those flushed jobs, with elapsed time.
+
+All logger.debug() calls -- zero overhead unless debug logging is
+enabled, no behavior change. Round-trip verified (apply/reverse/content
+check) against vLLM 0.27.1.
+
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -2342,11 +2342,24 @@
+         """Free the request's KV blocks, deferring the return to the block
+         pool when an in-flight GPU step may still write them.
+         """
+-        if not self.defer_block_free or (
++        immediate = not self.defer_block_free or (
+             # Last scheduled step already processed: no in-flight write remains
+             # (always the case for a normal finish), so free now.
+             request.last_sched_seq <= self.processed_step_seq
+-        ):
++        )
++        logger.debug(
++            "request-logging preemption-debug: _free_request_blocks(%s) "
++            "status=%s path=%s defer_block_free=%s last_sched_seq=%s "
++            "processed_step_seq=%s num_preemptions=%s",
++            request.request_id,
++            request.status,
++            "immediate" if immediate else "deferred",
++            self.defer_block_free,
++            request.last_sched_seq,
++            self.processed_step_seq,
++            request.num_preemptions,
++        )
++        if immediate:
+             self.kv_cache_manager.free(request)
+             return
+         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+--- a/v1/core/block_pool.py
++++ b/v1/core/block_pool.py
+@@ -736,6 +736,16 @@
+                     blocks_without_hash.append(block)
+                 else:
+                     blocks_with_hash.append(block)
++            elif block.ref_cnt > 0 and not block.is_null:
++                logger.debug(
++                    "request-logging preemption-debug: free_blocks() block %d "
++                    "NOT returned to cacheable pool (ref_cnt=%d after decrement, "
++                    "hash=%s) -- still held by another reference (e.g. an "
++                    "in-flight offload cascade)",
++                    block.block_id,
++                    block.ref_cnt,
++                    block.block_hash is not None,
++                )
+ 
+         # Blocks without hash get evicted first - prepend them last to the tail
+         self.free_block_queue.prepend_n(blocks_without_hash)
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1229,9 +1229,22 @@
+         for req_id in scheduler_output.preempted_req_ids or ():
+             req_status = self._req_status.get(req_id)
+             if req_status is None or not req_status.transfer_jobs:
++                logger.debug(
++                    "request-logging preemption-debug: preempted req %s has "
++                    "NO pending transfer_jobs to flush (req_status=%s)",
++                    req_id,
++                    "missing" if req_status is None else "present-but-empty",
++                )
+                 continue
+             any_jid = next(iter(req_status.transfer_jobs))
+             assert self._jobs[any_jid].is_store
++            logger.debug(
++                "request-logging preemption-debug: flushing %d transfer_jobs "
++                "for preempted req %s: %s",
++                len(req_status.transfer_jobs),
++                req_id,
++                req_status.transfer_jobs,
++            )
+             self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
+ 
+         # Flush jobs that contain re-allocated blocks.
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import time
+ from collections import defaultdict
+ from dataclasses import replace
+ 
+@@ -314,7 +315,20 @@
+         self._unsubmitted_store_jobs.clear()
+ 
+         if kv_connector_metadata.jobs_to_flush:
++            _t0 = time.monotonic()
++            logger.debug(
++                "request-logging preemption-debug: handle_preemptions() "
++                "waiting on %d jobs_to_flush: %s",
++                len(kv_connector_metadata.jobs_to_flush),
++                kv_connector_metadata.jobs_to_flush,
++            )
+             self.worker.wait(kv_connector_metadata.jobs_to_flush)
++            logger.debug(
++                "request-logging preemption-debug: handle_preemptions() "
++                "wait() returned after %.3fs for %d jobs",
++                time.monotonic() - _t0,
++                len(kv_connector_metadata.jobs_to_flush),
++            )
+ 
+     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
+         assert self.worker is not None
