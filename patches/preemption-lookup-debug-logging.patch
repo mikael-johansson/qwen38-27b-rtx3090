@@ -1,0 +1,48 @@
+More debug logging (no behavior change) for the same investigation:
+requires patches/preemption-offload-debug-logging.patch and
+patches/preemption-defer-block-free.patch applied first.
+
+The fix in preemption-defer-block-free.patch is confirmed working as
+designed (live trace: 2 in-flight offload store jobs correctly flushed
+and waited for, ~1s) but did NOT resolve the actual symptom -- a
+preempted-mid-prefill request still recomputes from scratch on retry
+(0% cached tokens, same TTFT as before the fix). Since only 2 jobs were
+ever in-flight (the vast majority of the request's ~50 chunks had
+already completed their store long before preemption), the real cause
+must be upstream of block-free timing entirely.
+
+This adds one targeted logger.debug() call right after the scheduler
+computes num_computed_tokens (local + external) for a request's lookup,
+scoped to request.num_preemptions > 0 (i.e. only retries, so it's cheap
+and low-volume) -- logs the local hit, external hit, total hit, and
+critically hit_diverged/load_kv_async, since hit_diverged is literally
+the "local hit's resume boundary has no valid Mamba state, reconcile to
+a boundary every group agrees on" signal from
+kv_cache_manager.get_computed_blocks_for_connector() -- exactly the
+kind of thing that could explain a total (not partial) cache miss on a
+retry despite the underlying block data being intact.
+
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -829,6 +829,21 @@
+                     num_computed_tokens = (
+                         num_new_local_computed_tokens + num_external_computed_tokens
+                     )
++                    if request.num_preemptions > 0:
++                        logger.debug(
++                            "request-logging preemption-debug: lookup result for "
++                            "retried req %s (attempt #%d): num_prompt_tokens=%d "
++                            "local_hit=%d external_hit=%d total_hit=%d "
++                            "hit_diverged=%s load_kv_async=%s",
++                            request.request_id,
++                            request.num_preemptions,
++                            request.num_prompt_tokens,
++                            num_new_local_computed_tokens,
++                            num_external_computed_tokens,
++                            num_computed_tokens,
++                            hit_diverged,
++                            load_kv_async,
++                        )
+                     assert num_computed_tokens <= request.num_tokens
+ 
+                     # Skip request with pending mm encoding prefetches
