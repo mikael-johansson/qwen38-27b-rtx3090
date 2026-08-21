@@ -1,0 +1,128 @@
+Fix (attempted): stop preemption from racing an in-flight offload cascade
+for the preempted request's own blocks.
+
+Requires patches/preemption-offload-debug-logging.patch to be applied
+first (this is an incremental diff on top of it -- same file, same
+methods).
+
+Root-cause hypothesis (2026-08-21 conversation, not yet empirically
+confirmed by the debug-logging patch's traces at the time this fix was
+written -- see that patch's header for full context): a request preempted
+mid-prefill goes through _preempt_request() -> _free_request_blocks(),
+which -- when the immediate-free branch is taken -- calls
+kv_cache_manager.free() synchronously, in the same scheduler pass that
+decided the preemption. block_pool.py's free_blocks() only returns a
+block to the reusable/cacheable pool once its ref_cnt reaches exactly 0.
+An in-flight offload cascade for that block (GPU -> CPU/NVMe secondary
+tier) holds its own ref_cnt via prepare_read()/complete_read(),
+independent of the existing defer_block_free GPU-step-in-flight guard.
+vLLM already has a mechanism meant to drain that cascade before reuse
+(jobs_to_flush, populated in offloading/scheduler.py's
+build_connector_meta() and waited on in offloading/worker.py's
+handle_preemptions()) -- but that flush happens on the worker side, as
+part of processing the step's connector metadata, which can happen
+*after* the scheduler has already freed (and potentially handed out to
+another request) the same blocks in the same pass.
+
+Fix: when a KV connector is active, _preempt_request() now always routes
+the freed blocks through the *deferred* free path (force_defer=True),
+fenced to the current step, instead of taking the immediate-free
+shortcut. Deferred blocks only re-enter the pool once
+processed_step_seq confirms that step has actually finished on the
+worker side (update_from_output()) -- which is after the worker's
+handle_preemptions() wait() on jobs_to_flush has had a chance to
+complete, instead of racing it.
+
+Safety-gated on self.defer_block_free also already being True:
+deferred-free entries are only ever drained (_drain_deferred_frees(),
+called from update_from_output()) when that flag is set. Forcing the
+deferred path without it would leak blocks -- queued forever, never
+returned to the pool -- instead of fixing anything. This means the fix
+is a no-op (falls back to prior behavior) in configs where
+defer_block_free is False (single in-flight batch, or a KV connector
+that isn't a consumer role) -- verified this repo's actual config has
+it True: kv_role="kv_both" satisfies is_kv_consumer, and
+--async-scheduling implies max_concurrent_batches > 1.
+
+Round-trip verified (apply/reverse/content check) against vLLM 0.27.1
+with patches/preemption-offload-debug-logging.patch already applied.
+Not yet verified against a live repro -- that's the next step, using
+the debug-logging patch's traces to confirm the fix actually closes the
+race rather than just changing its shape.
+
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -1287,7 +1287,17 @@
+         assert request.status == RequestStatus.RUNNING, (
+             "Only running requests can be preempted"
+         )
+-        self._free_request_blocks(request)
++        # force_defer=True whenever a KV connector is active: see
++        # _free_request_blocks()'s docstring for why an immediate free here
++        # can race an in-flight offload cascade for this request's blocks.
++        # Gated on self.defer_block_free too -- deferred entries only ever
++        # get drained (update_from_output(), guarded the same way) when
++        # that flag is set; forcing the deferred path without it would leak
++        # blocks (queued forever, never returned to the pool) instead of
++        # fixing anything.
++        self._free_request_blocks(
++            request, force_defer=self.connector is not None and self.defer_block_free
++        )
+         self.encoder_cache_manager.free(request)
+         self._inflight_prefills.discard(request)
+         request.status = RequestStatus.PREEMPTED
+@@ -2338,22 +2348,47 @@
+     def set_pause_state(self, pause_state: PauseState) -> None:
+         self._pause_state = pause_state
+ 
+-    def _free_request_blocks(self, request: Request):
++    def _free_request_blocks(self, request: Request, force_defer: bool = False):
+         """Free the request's KV blocks, deferring the return to the block
+         pool when an in-flight GPU step may still write them.
++
++        force_defer: always take the deferred path, even if the immediate-
++        free check below would otherwise apply. Used by _preempt_request()
++        when a KV connector is active: a preempted request's blocks may
++        still be mid-transfer in an offload cascade to a secondary tier
++        (CPU/NVMe) at the moment of preemption -- free_blocks() only
++        returns a block to the reusable/cacheable pool once its ref_cnt
++        hits exactly 0, and an in-flight cascade holds its own ref_cnt
++        (prepare_read()/complete_read()) independent of the GPU-step
++        in-flight concern this method otherwise guards against. The
++        connector's own jobs_to_flush mechanism (offloading/scheduler.py,
++        offloading/worker.py's handle_preemptions()) is meant to drain
++        that cascade during this same step's worker-side processing;
++        forcing the deferred path here fences this request's blocks to
++        not re-enter the pool until processed_step_seq confirms that
++        step has actually finished on the worker side, instead of racing
++        it via an immediate free in the same scheduler pass that decided
++        the preemption. See 2026-08-21 conversation: request preempted
++        mid-prefill recomputed from scratch on retry (0% cached, zero
++        kv_offload_load activity) despite the same tier correctly
++        restoring multi-GB of KV cache for requests that had already
++        finished normally before being evicted.
+         """
+-        immediate = not self.defer_block_free or (
+-            # Last scheduled step already processed: no in-flight write remains
+-            # (always the case for a normal finish), so free now.
+-            request.last_sched_seq <= self.processed_step_seq
++        immediate = not force_defer and (
++            not self.defer_block_free or (
++                # Last scheduled step already processed: no in-flight write
++                # remains (always the case for a normal finish), so free now.
++                request.last_sched_seq <= self.processed_step_seq
++            )
+         )
+         logger.debug(
+             "request-logging preemption-debug: _free_request_blocks(%s) "
+-            "status=%s path=%s defer_block_free=%s last_sched_seq=%s "
+-            "processed_step_seq=%s num_preemptions=%s",
++            "status=%s path=%s force_defer=%s defer_block_free=%s "
++            "last_sched_seq=%s processed_step_seq=%s num_preemptions=%s",
+             request.request_id,
+             request.status,
+             "immediate" if immediate else "deferred",
++            force_defer,
+             self.defer_block_free,
+             request.last_sched_seq,
+             self.processed_step_seq,
