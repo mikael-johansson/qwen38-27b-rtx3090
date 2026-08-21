@@ -24,7 +24,14 @@ DEFAULT_TOKEN = "88ff2b4ed74b68c225b49457f501d0e4cebd06f59d581e2e"
 
 def stream_chat(url: str, model: str, token: str, messages: list[dict]) -> list[dict]:
     payload = json.dumps(
-        {"model": model, "messages": messages, "stream": True}
+        {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            # Ask vLLM for a final usage-only chunk (empty choices, populated
+            # "usage") so we can compute real PP/gen tok/s, not just timing.
+            "stream_options": {"include_usage": True},
+        }
     ).encode("utf-8")
     req = urllib.request.Request(
         f"{url}/v1/chat/completions",
@@ -41,6 +48,7 @@ def stream_chat(url: str, model: str, token: str, messages: list[dict]) -> list[
     t_first_token = None
     t_last_token = None
     full_text = []
+    usage = None
 
     with urllib.request.urlopen(req) as resp:
         for raw_line in resp:
@@ -54,8 +62,13 @@ def stream_chat(url: str, model: str, token: str, messages: list[dict]) -> list[
             if data == "[DONE]":
                 break
             chunk = json.loads(data)
-            delta = chunk["choices"][0].get("delta", {})
-            piece = delta.get("content") or delta.get("reasoning_content")
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            piece = delta.get("content") or delta.get("reasoning")
             if piece:
                 if t_first_token is None:
                     t_first_token = now
@@ -67,11 +80,33 @@ def stream_chat(url: str, model: str, token: str, messages: list[dict]) -> list[
     ttfb = (t_first_byte - t_sent) if t_first_byte else None
     ttft = (t_first_token - t_sent) if t_first_token else None
     total = (t_last_token or t_first_byte or now) - t_sent
-    print(
-        f"\n[timing]  ttfb={ttfb:.3f}s  ttft={ttft:.3f}s  total={total:.3f}s"
-        if ttfb is not None and ttft is not None
-        else "\n[timing]  (no data received)"
-    )
+
+    parts = []
+    if ttfb is not None and ttft is not None:
+        parts.append(f"ttfb={ttfb:.3f}s")
+        parts.append(f"ttft={ttft:.3f}s")
+        parts.append(f"total={total:.3f}s")
+    else:
+        print("\n[timing]  (no data received)")
+        return [{"role": "assistant", "content": "".join(full_text)}]
+
+    if usage:
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if prompt_tokens and ttft > 0:
+            parts.append(f"pp={prompt_tokens / ttft:.1f}tok/s")
+        if (
+            completion_tokens
+            and completion_tokens > 1
+            and t_first_token is not None
+            and t_last_token is not None
+            and t_last_token > t_first_token
+        ):
+            gen_s = t_last_token - t_first_token
+            parts.append(f"gen={(completion_tokens - 1) / gen_s:.1f}tok/s")
+        parts.append(f"prompt={prompt_tokens} completion={completion_tokens}")
+
+    print("\n[timing]  " + "  ".join(parts))
     return [{"role": "assistant", "content": "".join(full_text)}]
 
 
