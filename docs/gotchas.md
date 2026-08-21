@@ -34,9 +34,16 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
    section: the same server does 35, 83 or 151 tok/s on `--dataset-name random`
    depending on what the noise turns into. Use real prompts
    (`--dataset-name custom`).
-7. **Bigger prefill chunks make things worse.** `--max-num-batched-tokens
-   8192` inflates the profiled activation peak, which shrinks the cache pool,
-   which caps concurrency. 2048 wins on this card.
+7. **Bigger prefill chunks make things worse — worse than this entry used
+   to say.** `--max-num-batched-tokens 8192` inflates the profiled
+   activation peak (shrinks the cache pool, caps concurrency) *and*, on
+   `--mamba-cache-mode align`, larger chunks hit a real vLLM leak in the
+   Mamba/GDN state-freeing check that never frees state during a
+   continuous prefill — a single, unopposed large prompt can self-preempt
+   against nothing but its own leak, or OOM-crash the engine outright at
+   8192. 1024 wins on this card, not 2048; see
+   [docs/mamba-align-prefill-leak.md](mamba-align-prefill-leak.md) for the
+   full mechanism and what the real upstream fix would need to touch.
 8. **Benchmark twice.** The first run after any restart includes JIT warmup
    and reads 30-50% low.
 9. **`--language-model-only` drops the vision tower cleanly** (no weights
