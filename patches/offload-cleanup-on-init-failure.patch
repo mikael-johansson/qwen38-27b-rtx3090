@@ -1,0 +1,132 @@
+Fix a real /dev/shm leak in vLLM's CPU KV-offload connector
+(--kv-offloading-size): if SharedOffloadRegion.__init__() fails partway
+through mmap()/MADV_POPULATE_WRITE (e.g. OSError EFAULT, which happens
+when the backing tmpfs doesn't have room to actually commit the pages a
+large region just sparse-allocated via ftruncate — hit on this repo's
+16GB /dev/shm with --kv-offloading-size 12 after two restarts), the
+creator's multi-GB file was left orphaned in /dev/shm forever. Two such
+leaks are enough to fill a 16GB tmpfs outright, at which point every
+subsequent start fails the same way even with a fully healthy config.
+
+This happens inside EngineCoreProc.__init__(), before vLLM's own
+shutdown()/cleanup() machinery exists to run, so there is no later hook
+to catch it. An atexit-based fix was considered and rejected: verified
+directly (not assumed) that atexit callbacks registered inside a
+multiprocessing child do NOT fire when that child exits via an uncaught
+exception (reproduced in isolation: multiprocessing.Process target raises,
+child exitcode=1, atexit callback never ran). The fix instead wraps the
+risky mmap()+madvise() section in try/except and cleans up inline, in the
+same stack frame as the failure, which cannot depend on any exit-handler
+machinery at all. Reproduced the exact real failure against the real
+kernel (oversized region > tmpfs capacity, same OSError(14, 'Bad address')
+as the live crash) and confirmed the file no longer survives it.
+
+Apply from the installed vllm package directory:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/offload-cleanup-on-init-failure.patch
+
+Written against vLLM 0.27.1. Reapply after upgrades.
+--- a/v1/kv_offload/cpu/shared_offload_region.py	2026-08-20 18:12:17.827731061 +0000
++++ b/v1/kv_offload/cpu/shared_offload_region.py	2026-08-20 18:10:49.530849927 +0000
+@@ -78,44 +78,68 @@
+             _wait_for_file_size(self.fd, self.total_size_bytes)
+             logger.info("Opened existing mmap file %s", self.mmap_path)
+ 
+-        self.mmap_obj: mmap.mmap | None = mmap.mmap(
+-            self.fd,
+-            self.total_size_bytes,
+-            flags=mmap.MAP_SHARED,
+-            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+-        )
++        # request-logging note: _views/_base/is_pinned are normally set at the
++        # end of __init__, but are pre-initialized here (ahead of the risky
++        # mmap()+madvise() section below) so that self.cleanup() is safe to
++        # call from the except block on failure without an AttributeError.
++        self.mmap_obj: mmap.mmap | None = None
++        self._base: torch.Tensor | None = None
++        self._views: list[torch.Tensor] = []
++        self.is_pinned: bool = False
+ 
+-        # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
+-        _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+-        if rank is not None:
+-            # Populate only this worker's pages (one slot per block row).
+-            worker_offset = rank * cpu_page_size
+-            _t0 = time.perf_counter()
+-            page_size = self.page_size
+-            for block in range(num_blocks):
+-                raw_offset = block * self._row_stride + worker_offset
+-                aligned_offset = (raw_offset // page_size) * page_size
+-                end = raw_offset + cpu_page_size
+-                aligned_length = end - aligned_offset
+-                self.mmap_obj.madvise(
+-                    _MADV_POPULATE_WRITE, aligned_offset, aligned_length
+-                )
+-            logger.debug(
+-                "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
+-                num_blocks,
+-                time.perf_counter() - _t0,
+-            )
+-        else:
+-            # No rank — populate the entire shared region in one call.
+-            _t0 = time.perf_counter()
+-            self.mmap_obj.madvise(_MADV_POPULATE_WRITE, 0, self.total_size_bytes)
+-            logger.debug(
+-                "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
++        try:
++            self.mmap_obj = mmap.mmap(
++                self.fd,
++                self.total_size_bytes,
++                flags=mmap.MAP_SHARED,
++                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+             )
+ 
++            # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
++            _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
++            if rank is not None:
++                # Populate only this worker's pages (one slot per block row).
++                worker_offset = rank * cpu_page_size
++                _t0 = time.perf_counter()
++                page_size = self.page_size
++                for block in range(num_blocks):
++                    raw_offset = block * self._row_stride + worker_offset
++                    aligned_offset = (raw_offset // page_size) * page_size
++                    end = raw_offset + cpu_page_size
++                    aligned_length = end - aligned_offset
++                    self.mmap_obj.madvise(
++                        _MADV_POPULATE_WRITE, aligned_offset, aligned_length
++                    )
++                logger.debug(
++                    "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
++                    num_blocks,
++                    time.perf_counter() - _t0,
++                )
++            else:
++                # No rank — populate the entire shared region in one call.
++                _t0 = time.perf_counter()
++                self.mmap_obj.madvise(_MADV_POPULATE_WRITE, 0, self.total_size_bytes)
++                logger.debug(
++                    "MADV_POPULATE_WRITE entire region: %.3f s",
++                    time.perf_counter() - _t0,
++                )
++        except BaseException:
++            # A failure here (e.g. OSError/EFAULT from MADV_POPULATE_WRITE
++            # when the backing tmpfs doesn't have room to actually commit
++            # the pages it just sparse-allocated via ftruncate) would
++            # otherwise leave a multi-GB creator-owned file orphaned in
++            # /dev/shm forever: this happens inside EngineCoreProc.__init__,
++            # before vLLM's own shutdown()/cleanup() machinery exists to run,
++            # and — verified directly, not assumed — an atexit hook does not
++            # fire either, since this constructor runs inside a
++            # multiprocessing child and an uncaught exception there exits
++            # without invoking atexit callbacks. Clean up inline, in the same
++            # stack frame as the failure, then re-raise.
++            if self._creator:
++                self.cleanup()
++            raise
++
+         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
+-        self._views: list[torch.Tensor] = []
+-        self.is_pinned: bool = False
+ 
+     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
+         """Allocate a strided int8 view for this worker, one canonical tensor.
