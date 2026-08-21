@@ -1,0 +1,73 @@
+Debug-only, no behavior change. Adds a per-KV-cache-group breakdown of
+block allocation to KVCacheCoordinator.get_num_blocks_to_allocate(),
+logged whenever free blocks drop below 15% of the pool.
+
+This was the patch that found the real per-token cost split for this
+hybrid model: 4 KV-cache groups share one block pool (3x MambaManager +
+1x FullAttentionManager, block_size=832 each), not the 1-2 you'd assume
+from "hybrid attention+mamba". See docs/mamba-align-prefill-leak.md for
+the full writeup this trace produced.
+
+--- a/v1/core/kv_cache_coordinator.py
++++ b/v1/core/kv_cache_coordinator.py
+@@ -5,6 +5,7 @@
+ from typing import NamedTuple
+
+ from vllm import envs
++from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+@@ -26,6 +27,8 @@
+ )
+ from vllm.v1.request import Request
+
++logger = init_logger(__name__)
++
+
+ def _validate_prefix_cache_retention_interval(
+     retention_interval: int | None,
+@@ -164,11 +167,12 @@
+             The number of blocks to allocate.
+         """
+         num_blocks_to_allocate = 0
++        per_group_debug = []
+         for i, manager in enumerate(self.single_type_managers):
+             if isinstance(manager, CrossAttentionManager):
+                 # For cross-attention, we issue a single static allocation
+                 # of blocks based on the number of encoder input tokens.
+-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
++                group_blocks = manager.get_num_blocks_to_allocate(
+                     request_id,
+                     num_encoder_tokens,
+                     [],
+@@ -178,7 +182,7 @@
+                     apply_admission_cap=apply_admission_cap,
+                 )
+             else:
+-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
++                group_blocks = manager.get_num_blocks_to_allocate(
+                     request_id,
+                     num_tokens,
+                     new_computed_blocks[i],
+@@ -187,6 +191,20 @@
+                     num_tokens_main_model,
+                     apply_admission_cap=apply_admission_cap,
+                 )
++            num_blocks_to_allocate += group_blocks
++            per_group_debug.append(
++                (i, type(manager).__name__, manager.block_size, group_blocks,
++                 len(manager.req_to_blocks.get(request_id, ())))
++            )
++        free = self.block_pool.get_num_free_blocks()
++        if free < 0.15 * self.block_pool.num_gpu_blocks:
++            logger.debug(
++                "request-logging preemption-debug: get_num_blocks_to_allocate "
++                "req=%s num_tokens=%d total_computed=%d groups=%s total_new=%d "
++                "free_blocks=%d",
++                request_id, num_tokens, total_computed_tokens, per_group_debug,
++                num_blocks_to_allocate, free,
++            )
+         return num_blocks_to_allocate
+
+     def allocate_new_computed_blocks(

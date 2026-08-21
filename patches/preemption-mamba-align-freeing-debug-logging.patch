@@ -1,0 +1,58 @@
+Debug-only, no behavior change. Logs the mamba_cache_mode="align" state-
+block freeing check in remove_skipped_blocks() -- last_state_block_idx
+vs. the processed_computed_tokens threshold -- whenever free blocks drop
+below 15% of the pool.
+
+This is the patch that proved the mamba-align freeing check
+(last_state_block_idx < threshold, a strict "<") never fires during a
+continuous chunked-prefill run: the two sides advance in lockstep and
+stay exactly equal every step, so will_free was False 100% of the time
+(0/107 samples) across every one of the model's 3 Mamba/GDN KV-cache
+groups, at both max-num-batched-tokens=1024 and 2048. It only starts
+passing once decode begins and per-step chunk sizes shrink. Full writeup:
+docs/mamba-align-prefill-leak.md.
+
+--- a/v1/core/single_type_kv_cache_manager.py
++++ b/v1/core/single_type_kv_cache_manager.py
+@@ -6,6 +6,7 @@
+ from collections.abc import Sequence
+ from typing import ClassVar
+
++from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_utils import (
+@@ -32,6 +33,8 @@
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ from vllm.v1.request import Request
+
++logger = init_logger(__name__)
++
+
+ class SingleTypeKVCacheManager(ABC):
+     """
+@@ -1433,11 +1436,22 @@
+             # Blocks allocated during prefill may be non-contiguous. Use
+             # `last_state_block_idx` to free the appropriate block and replace it
+             # with a null block.
+-            if (
++            will_free = (
+                 last_state_block_idx is not None
+                 and last_state_block_idx
+                 < cdiv(processed_computed_tokens, self.block_size) - 1
+-            ):
++            )
++            free = self.block_pool.get_num_free_blocks()
++            if free < 0.15 * self.block_pool.num_gpu_blocks:
++                logger.debug(
++                    "request-logging preemption-debug: mamba remove_skipped_blocks "
++                    "group=%d req=%s processed_computed_tokens=%d "
++                    "last_state_block_idx=%s threshold=%d will_free=%s",
++                    self.kv_cache_group_id, request_id, processed_computed_tokens,
++                    last_state_block_idx, cdiv(processed_computed_tokens, self.block_size) - 1,
++                    will_free,
++                )
++            if will_free:
+                 blocks = self.req_to_blocks[request_id]
+                 if blocks[last_state_block_idx] != self._null_block:
+                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
