@@ -1,0 +1,200 @@
+Close a real KV-offload eviction/store-completion race: content that is
+still being asynchronously copied to the CPU/disk offload tier can get
+silently overwritten by an unrelated concurrent request's GPU block
+allocation, with no wait and no error -- the copy just races the reuse
+and loses, or corrupts. This isn't the same bug as the (now-removed)
+discard-unoffloaded-kv-warning.patch's false-positive warning from
+earlier in this investigation: that one fired on ordinary, benign
+completion/unpinning. This is real, occasional, unrecoverable data loss
+under real concurrent load between two large conversations, discovered
+2026-08-22 while investigating live production request logs (see
+docs/mamba-align-prefill-leak.md's "offload eviction race" section).
+
+Root cause: v1/kv_offload's OffloadingConnectorScheduler already has a
+correct mechanism for this -- `_block_id_to_pending_jobs` -- checked in
+build_connector_meta() every step: if a block about to be reallocated
+this step has an in-flight store job registered against it, that job is
+force-flushed (waited on) before the reuse proceeds, so the copy always
+completes reading the old content before it's overwritten. But
+_build_store_jobs() only ever registered *non-sliding-window* blocks
+(i.e. ordinary full-attention and Mamba/GDN blocks -- everything in this
+repo's hybrid model except sliding-window groups) into
+_block_id_to_pending_jobs once the owning request had already finished
+(`if req.is_finished():`), with a comment explaining the assumption:
+"running-request blocks are protected by their ref_cnt". That assumption
+is true and sufficient while the request is actively running (a block
+still ref-counted by a live request can never be pulled from the free
+queue by anyone else) -- but it says nothing about the window that opens
+the instant the request finishes and its blocks are unpinned back to the
+free pool (ref_cnt -> 0, hash preserved for prefix-cache reuse) while a
+store job created *earlier*, during that same request's own execution,
+may still be mid-copy. A concurrent request's own allocation can reclaim
+exactly that block in that window, and the store job for it was never
+registered anywhere -- so the existing flush-before-reuse check has
+nothing to flush, and the reuse proceeds unprotected.
+
+Confirmed via live production request/response logs, 2026-08-22 ~18:03-
+18:09 UTC: two large concurrent Hermes Agent conversations (a 174->186
+message coding session and a separate long story-writing session) each
+alternated between ~97% cache-hit turns (~2.7s prefill) and ~29% (or
+even 0%) cache-hit turns (~60s prefill) -- same growing thread, same
+content, no client-side errors. Traced one transition precisely: content
+freshly computed by one thread's turn (finishing at 18:06:51, still
+resident and confirmed hit by the very next turn moments later) was
+gone again just ~50s later, at 18:07:41 -- exactly the window in which
+the other thread's own large concurrent prefill (18:06:57-18:07:41,
+0% cache hit itself, so also freshly allocating many new blocks) ran.
+block_pool usage traced directly across that window: 152 blocks used at
+18:06:55, dropped to 117 by 18:07:05 (35 blocks / 29,120 tokens freed --
+not because the pool was full; peak usage this whole window never
+exceeded 71%, so this was ordinary LRU reclaim of idle-but-not-yet-
+durable content, not pool exhaustion), then climbed back up as the other
+thread's own prefill filled that reclaimed space. For the affected
+request (84ff76ce...), only 2 store-job-creation log lines appeared for
+its entire ~46,000-token fresh compute, both within the last ~23 seconds
+before it finished -- i.e. essentially all of that content's store job(s)
+were created while `req.is_finished()` was still False, so none of them
+were ever registered for flush protection at any point before the race
+occurred.
+
+Because a prefix-cache hit lookup (_maximal_prefix_lookup /
+_sliding_window_lookup) walks the block-hash chain from the start and
+stops at the *first* miss, losing even a single block this way silently
+invalidates every block after it in the chain too -- which is why the
+observed damage (a ~44,000-token full recompute) was so much larger than
+the handful of blocks actually reclaimed. This also explains why the
+affected turns always plateaued at exactly the same fixed token count
+(23 blocks / 19,136 tokens, block_size=832): that portion had evidently
+completed its own store+flush-protection cycle safely at some earlier,
+less-contended point and was reliably durable regardless of GPU churn,
+while everything computed since was still racing the offload pipeline.
+
+The fix: register non-sliding-window blocks into
+_block_id_to_pending_jobs immediately at store-job creation time, exactly
+like sliding-window blocks already do -- not gated on req.is_finished().
+This costs nothing extra for the actively-running case (ref_cnt already
+guarantees those block_ids can never appear in
+_current_batch_allocated_block_ids while the owning request is alive, so
+the flush check simply never fires for them, same as before) and closes
+the gap for the only case that mattered: the block was freed by its
+owner finishing, and a job created before that finish hadn't completed
+yet. Cleanup (_remove_pending_job) is updated symmetrically to run
+unconditionally for both block kinds, matching the now-symmetric
+registration. request_finished()'s own retroactive registration loop is
+left in place (now a redundant, harmless, idempotent no-op most of the
+time) as a defense-in-depth safety net rather than removed, to keep the
+change minimal.
+
+Not yet re-verified live under the same two-large-concurrent-conversation
+load that originally exposed this (this session was asked to investigate
+and fix, not to spin up a fresh multi-hour repro) -- please watch for the
+qwen.log pattern that flagged this originally (a Cached tokens percentage
+in the request log's PERFORMANCE summary that regresses on a later turn
+of the same growing thread, especially back down to a fixed token count
+it had already exceeded on an earlier turn) and let this investigation
+know if it's still reproducible.
+
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -524,9 +524,24 @@
+ 
+         # block_id -> pending store job_ids. Used to track jobs that needs
+         # flushing in case a block is re-allocated by the KV cache manager.
+-        # Populated only for finished requests (running-request blocks are
+-        # protected by their ref_cnt) and for sliding window blocks (which can
+-        # be freed before a request finishes).
++        #
++        # request-logging offload-eviction-race fix: populated immediately
++        # at store-job creation for ALL blocks (sliding-window and
++        # non-sliding-window alike), not only once the owning request
++        # finishes. The original "running-request blocks are protected by
++        # their ref_cnt" assumption is true for the running request's OWN
++        # allocation, but it does not cover the window right after that
++        # request finishes and unpins its blocks (ref_cnt -> 0, returned to
++        # the free pool with hash preserved for prefix-cache reuse): a
++        # concurrent request's own allocation can reclaim one of those
++        # blocks before its store job -- created earlier, while the owner
++        # was still running -- has actually completed. Since a prefix-hit
++        # lookup walks the block-hash chain from the start and stops at the
++        # first miss, losing even one block this way silently invalidates
++        # every block after it in the chain too, forcing a full recompute
++        # of content that (mostly) was in fact still safely stored. See
++        # docs/mamba-align-prefill-leak.md's offload-eviction-race section
++        # and offload-flush-protect-running-request-blocks.patch.
+         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+ 
+         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+@@ -1230,8 +1245,15 @@
+             for bid in sliding_window_block_ids or ():
+                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+ 
+-            # the non-sliding window blocks will be watched only
+-            # when the request finishes
++            # request-logging offload-eviction-race fix: also watch
++            # non-sliding-window blocks immediately, not only once the
++            # request finishes -- see patch docstring
++            # (offload-flush-protect-running-request-blocks.patch).
++            for bid in non_sliding_window_block_ids:
++                self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
++                if bid in self._current_batch_allocated_block_ids:
++                    self._current_batch_jobs_to_flush.add(job_id)
++
+             self._jobs[job_id] = TransferJobStatus(
+                 req_id=req_id,
+                 pending_count=self.config.num_workers,
+@@ -1253,13 +1275,6 @@
+                 job_id,
+             )
+ 
+-            if req.is_finished():
+-                # Register non-sliding-window blocks for flush detection.
+-                for bid in non_sliding_window_block_ids:
+-                    self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+-                    if bid in self._current_batch_allocated_block_ids:
+-                        self._current_batch_jobs_to_flush.add(job_id)
+-
+         return store_jobs
+ 
+     def build_connector_meta(
+@@ -1402,15 +1417,16 @@
+                 if self._chunks_being_loaded:
+                     self._chunks_being_loaded.difference_update(job_status.keys)
+             if self._block_id_to_pending_jobs:
+-                # Sliding window blocks are tracked from store creation
+-                # and must be cleaned up unconditionally.
++                # request-logging offload-eviction-race fix: both
++                # sliding-window and non-sliding-window blocks are now
++                # tracked from store creation (see the registration site
++                # in _build_store_jobs), so both must be cleaned up
++                # unconditionally here too -- see patch docstring
++                # (offload-flush-protect-running-request-blocks.patch).
+                 self._remove_pending_job(job_id, job_status.sliding_window_block_ids)
+-                # Non-sliding-window blocks are only tracked after
+-                # request_finished, so only clean up for finished requests.
+-                if req_status.req.is_finished():
+-                    self._remove_pending_job(
+-                        job_id, job_status.non_sliding_window_block_ids
+-                    )
++                self._remove_pending_job(
++                    job_id, job_status.non_sliding_window_block_ids
++                )
+ 
+             del self._jobs[job_id]
+             req_status.transfer_jobs.remove(job_id)
+@@ -1464,8 +1480,14 @@
+ 
+         # Keep req_status alive: _build_store_jobs will process finished_req_ids
+         # on the next step and handle cleanup after creating store jobs.
+-        # Register non_sliding_window_block_ids so future block reuse triggers
+-        # a flush via _block_id_to_pending_jobs.
++        #
++        # request-logging offload-eviction-race fix: this used to be the
++        # only place non-sliding-window blocks got registered in
++        # _block_id_to_pending_jobs. _build_store_jobs now registers them
++        # unconditionally at store-job creation time instead (see its own
++        # comment), so every job here has already been registered -- this
++        # loop is now a redundant (harmless, idempotent) safety net rather
++        # than the sole registration point.
+         for job_id in req_status.transfer_jobs:
+             job_status = self._jobs[job_id]
+             for bid in job_status.non_sliding_window_block_ids or ():

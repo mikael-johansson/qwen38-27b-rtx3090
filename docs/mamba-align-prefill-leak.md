@@ -14,6 +14,20 @@
 > of combined demand against a ~172K-token pool) completes with zero
 > preemptions and zero discarded/never-offloaded KV cache. `--max-num-
 > batched-tokens` no longer needs to be held at 1024.
+>
+> **UPDATE 2026-08-22, ~18:35 UTC: a third, separate real bug found and
+> fixed** -- `patches/offload-flush-protect-running-request-blocks.patch`.
+> Found via live production request-log analysis (two large concurrent
+> agentic conversations), not synthetic stress testing. Content whose
+> async store-to-CPU/disk job was still in flight at the moment its owning
+> request finished and unpinned its blocks could get silently reclaimed by
+> an unrelated concurrent request's own allocation before the copy
+> completed -- a real, occasional, unrecoverable-without-recompute data
+> loss under real dual-large-conversation contention (not the earlier
+> discard-warning's false positive; that diagnostic patch was itself
+> removed the same session once confirmed benign -- see "Offload
+> eviction race" section below). NOT yet re-verified live under the same
+> concurrent-load conditions that exposed it.
 
 Investigated 2026-08-21/22, branch `request_logging`. This was a real bug
 in upstream vLLM 0.27.1's `mamba_cache_mode=align` implementation, not a
@@ -859,3 +873,78 @@ needed again.
 
 grep `qwen.log` for `request-logging preemption-debug:` to find the
 diagnostic patches' output.
+
+## Offload eviction race -- content lost to a concurrent request before its own store job completed (2026-08-22)
+
+Follow-up investigation, same day, prompted by the user asking "why is
+there so much prefill going on?" while watching live production traffic,
+then "just want to make sure it's actual new prefill data and not cache
+misses". Two distinct findings came out of this, one benign (a false
+alarm removed) and one real (fixed).
+
+### False alarm: `discard-unoffloaded-kv-warning.patch` removed
+
+Earlier this session a diagnostic warning was added
+(`_warn_if_discarding_unoffloaded_kv` in `scheduler.py`, fired from
+`_free_request_blocks()`) to catch exactly this class of bug. It fired
+on the user's real production log (`Discarding KV cache for session
+...!!! 8691 of 8691 computed tokens were never offloaded`). Investigation
+found this specific firing was a **false positive**: it compares a
+request's own `num_computed_tokens` against *that request's own*
+`next_stored_chunk_idx` -- but a request whose content is almost entirely
+inherited via local prefix-cache hit from an *earlier* request (very
+common in this deployment: a large shared system prompt reused across
+many conversations, so a new request often shows only ~30 fresh tokens
+of its own) never ran its own store-job pipeline and so always looks
+"0% offloaded" to this check, even though the inherited content was very
+likely already safely offloaded under the earlier request's own
+bookkeeping. Confirmed via `block_pool.free_blocks()`'s own semantics
+(a freed block keeps its hash and stays hit-able, not wiped) and via a
+live 2-turn test (turn 2 got a fast cache hit immediately after turn 1
+would have triggered this exact warning). Once confirmed benign, the
+warning was fully reverted -- both from the live venv and by deleting
+`patches/discard-unoffloaded-kv-warning.patch` -- since it no longer
+served its original purpose (the mamba leak it was built to help
+diagnose was already found and fixed) and only produced noise for the
+(quite common, in this deployment) shared-prefix-inheritance pattern.
+
+### Real bug found: async store jobs unprotected from eviction while a request is mid-execution or has just finished
+
+Prompted by the user's report of unexplained "lots of prefill" that
+turned out, on closer look at the request logs' own `Cached tokens`
+percentage, to genuinely regress turn over turn within the same growing
+conversation thread (97% hit -> 2.7s prefill, then next turn 29% hit ->
+60s prefill, alternating). Traced with two large concurrent Hermes Agent
+conversations actually running in production (not synthetic) -- see
+`patches/offload-flush-protect-running-request-blocks.patch`'s own
+docstring for the full root-cause writeup and the exact
+`block_pool` usage trace (152 -> 117 -> climbing blocks) that pinned the
+mechanism precisely: `_block_id_to_pending_jobs` (the flush-before-reuse
+protection that's supposed to force an in-flight store job to complete
+before its GPU block gets physically reused) only ever registered
+non-sliding-window blocks (ordinary attention + Mamba/GDN) once the
+owning request had *already finished* -- leaving every store job created
+while a request was still mid-execution completely unprotected the
+moment that request finished and its blocks were unpinned, if the job
+hadn't completed yet. Because a prefix-hit lookup stops at the first
+missing block in the chain, losing even one block this way silently
+invalidated everything after it too -- turning a handful of genuinely
+racy blocks into a ~44,000-token full recompute.
+
+Fixed by registering non-sliding-window blocks into
+`_block_id_to_pending_jobs` immediately at store-job creation (matching
+what sliding-window blocks already did unconditionally), not gated on
+`req.is_finished()`. Verified: patch applies/reverses cleanly against the
+live venv (`verify.sh`), full file re-parses, and the reasoning that this
+adds no overhead for the actively-running case (ref_cnt already prevents
+those blocks from ever being reallocated while their owner is alive, so
+the new registration is inert until it's actually needed) was checked
+against the relevant `get_new_blocks()`/`update_state_after_alloc()` code
+paths. **Not yet re-verified live** under the same two-large-concurrent-
+conversation load that originally exposed it -- this session investigated
+and fixed it live, in production, without spinning up a fresh multi-hour
+synthetic repro. If the same symptom (a `Cached tokens` percentage that
+regresses on a later turn of an already-longer thread, especially back
+down to a fixed floor it had already exceeded) shows up again in
+`qwen.log`/`requests/*.log`, this fix did not fully close the gap and
+needs another look.
