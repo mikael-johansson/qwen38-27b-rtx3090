@@ -1,0 +1,239 @@
+Add a disk-size cap + LRU eviction to the fs KV-offload secondary tier.
+
+Full investigation: docs/mamba-align-prefill-leak.md's "no disk cap"
+section. vLLM 0.27.1's FileSystemTierManager (v1/kv_offload/tiering/fs/
+manager.py) and FileMapper (v1/kv_offload/file_mapper.py) have no size
+limit or eviction policy at all -- unlike the primary CPU tier
+(cpu_bytes_to_use, LRU/ARC eviction), the fs secondary tier just writes
+block files to root_dir forever. On a long-running server this fills the
+disk in hours to days at typical KV-cache-offload data rates, not
+something an external periodic script (prune_kv_offload_cache.sh, this
+repo's earlier attempt) can keep up with -- the growth is continuous
+while the server runs, so the enforcement has to be too.
+
+New FileSystemTierManager.__init__ kwargs (both optional, default
+0/backward-compatible -- zero behavior change unless configured):
+
+  max_disk_gib: cap this tier's on-disk usage (this rank's own block
+    directory, "<base_path>_r<rank>/") at approximately this many GiB.
+  disk_cap_check_interval_s: how often to re-check (default 120s).
+
+When max_disk_gib > 0, a dedicated daemon thread (vllm_kv_fs_disk_cap)
+periodically walks this rank's block directory and deletes the least-
+recently-*accessed* (atime, not mtime -- a real recency signal as long
+as the filesystem isn't mounted noatime; relatime, the common default,
+is sufficient) *.bin files until usage is back at or under the cap.
+Deliberately runs off the main scheduling thread and only on a slow
+timer: the scan is a full recursive directory walk, and this code lives
+directly downstream of a subsystem (align-mode Mamba + KV offloading)
+that this investigation found to be extremely sensitive to anything
+synchronous stalling the scheduler -- see the mamba-align doc's hang
+investigation. A background thread bounded by a long interval can never
+have that failure mode, unlike a synchronous check hooked into
+get_finished_jobs() or lookup().
+
+Safe to race concurrent stores/reads/promotions on a live server:
+deleting a file that's mid-read just produces one ordinary MISS for that
+lookup (the connector already handles MISS gracefully, confirmed
+extensively elsewhere in this investigation), never a crash or torn
+read, since block files are only ever removed whole by filename, never
+truncated or rewritten in place.
+
+Reference design: CachyLLama's --cache-ssd-cold-maxsize
+(~/git/cachy-fork, tools/server/server-context-page-manager.cpp) --
+global byte cap, oldest-mtime-first eviction of whole conversation
+directories, enforced under the existing lock after each store. Ported
+the core idea (a size cap with LRU-style eviction, opt-in, default
+unlimited) but not the implementation: CachyLLama needs an in-memory
+index of on-disk state (and had to fix a real bug where that index went
+stale across process restarts, see its commit 162663327 -- lesson
+applied here from the start) because its checkpoints carry additional
+per-slot metadata; vLLM's fs tier has no equivalent index at all --
+os.path.exists() on a deterministic content-hash path *is* the whole
+lookup mechanism -- so a plain filesystem walk is already the correct
+source of truth here, with no bookkeeping to keep in sync.
+
+Verified (2026-08-22) with a standalone test against the real eviction
+method (bypassing full engine/model construction): correctly evicts
+exactly the oldest-atime files down to the target cap, correctly no-ops
+when already under cap re-run immediately after, correctly leaves the
+per-run config.json (one directory level up, not a *.bin file) alone,
+correctly handles a not-yet-existing directory without raising, and the
+background-thread start/stop lifecycle joins cleanly with no hang.
+NOT yet verified against a live model-loaded server (this session was
+asked to code but not launch vLLM while the user tests the two prior
+fixes concurrently) -- please verify a real run's log line looks sane
+before relying on it unattended:
+  KV offload fs tier '<type>': capping on-disk usage at N GiB ...
+and, once the cap is actually exceeded in practice:
+  KV offload fs tier: disk cap exceeded (...) -- evicted N ...
+
+Wired up in micke-start.sh's kv-transfer-config JSON: added
+"max_disk_gib":200 to the fs secondary_tiers entry.
+
+--- a/v1/kv_offload/tiering/fs/manager.py
++++ b/v1/kv_offload/tiering/fs/manager.py
+@@ -18,6 +18,7 @@
+ import functools
+ import json
+ import os
++import threading
+ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, ClassVar
+ 
+@@ -116,6 +117,8 @@
+         n_write_threads: int = 16,
+         enable_kv_events: bool = False,
+         locality: str | None = None,
++        max_disk_gib: float = 0,
++        disk_cap_check_interval_s: float = 120.0,
+     ):
+         """
+         Args:
+@@ -131,6 +134,24 @@
+                 cache events are enabled globally (kv_events_config).
+             locality: Whether this tier's storage is LOCAL or REMOTE relative
+                 to the publishing vLLM instance.
++            max_disk_gib: Cap this tier's on-disk usage (this rank's block
++                directory only) at approximately this many GiB. 0 (default)
++                = unlimited, unchanged behavior. When set, a background
++                thread periodically deletes the least-recently-accessed
++                *.bin block files (by atime) until usage is back at or under
++                the cap. There is no size/eviction control for this tier
++                upstream in vLLM 0.27.1 -- unlike the primary CPU tier's
++                cpu_bytes_to_use -- so this is a from-scratch addition, not
++                exposing an existing mechanism. See
++                docs/mamba-align-prefill-leak.md's "no disk cap" section in
++                this repo for the investigation that found the gap.
++            disk_cap_check_interval_s: How often the background thread
++                re-scans and evicts. Only relevant when max_disk_gib > 0.
++                The scan is a full recursive walk of this rank's directory,
++                so it's deliberately infrequent and runs off the main
++                scheduling thread -- it must never be able to stall request
++                processing, which is why this isn't a synchronous check
++                inside get_finished_jobs()/lookup().
+         """
+         super().__init__(offloading_spec, primary_kv_view, tier_type)
+         self.locality = Locality(locality) if locality is not None else None
+@@ -192,6 +213,112 @@
+ 
+         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+ 
++        # This rank's own block directory -- see FileMapper.get_file_name():
++        # paths are "<base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash>.bin".
++        # The disk cap only scans/evicts here, never the sibling
++        # "<base_path>/config.json" one level up.
++        self._disk_cap_dir = f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
++        self._max_disk_bytes = (
++            int(max_disk_gib * (1024**3)) if max_disk_gib > 0 else 0
++        )
++        self._disk_cap_thread: threading.Thread | None = None
++        self._disk_cap_stop = threading.Event()
++        if self._max_disk_bytes:
++            logger.info(
++                "KV offload fs tier '%s': capping on-disk usage at %.1f GiB "
++                "(least-recently-accessed *.bin files evicted first; "
++                "checked every %.0fs in a background thread) -- %s",
++                tier_type,
++                max_disk_gib,
++                disk_cap_check_interval_s,
++                self._disk_cap_dir,
++            )
++            self._disk_cap_thread = threading.Thread(
++                target=self._disk_cap_loop,
++                args=(disk_cap_check_interval_s,),
++                name="vllm_kv_fs_disk_cap",
++                daemon=True,
++            )
++            self._disk_cap_thread.start()
++
++    def _disk_cap_loop(self, interval_s: float) -> None:
++        # Wait out the first interval before the first check so this never
++        # competes with model/server startup I/O.
++        while not self._disk_cap_stop.wait(interval_s):
++            try:
++                self._evict_for_disk_cap()
++            except Exception:
++                # Best-effort background maintenance: never let an
++                # unexpected error kill this thread and silently stop
++                # enforcing the cap for the rest of the server's life.
++                logger.exception(
++                    "KV offload fs tier: disk-cap eviction pass failed, "
++                    "will retry on the next interval"
++                )
++
++    def _evict_for_disk_cap(self) -> None:
++        """Scan this rank's block directory and delete the
++        least-recently-accessed *.bin files until usage is back at or under
++        max_disk_gib.
++
++        Runs entirely off the main scheduling thread (see _disk_cap_loop).
++        Safe to race concurrent stores/reads/promotions: a file this pass
++        decides to delete might be re-read a moment later by an unrelated
++        in-flight job, in which case that one lookup sees a plain MISS (the
++        same outcome as if the file had simply never been offloaded) and
++        falls back to recomputing that chunk -- never a crash or corrupted
++        read, since blocks are only ever removed by filename, whole, never
++        truncated or rewritten in place.
++        """
++        total = 0
++        entries: list[tuple[float, int, str]] = []  # (atime, size, path)
++        try:
++            for dirpath, _dirnames, filenames in os.walk(self._disk_cap_dir):
++                for fname in filenames:
++                    if not fname.endswith(".bin"):
++                        continue
++                    path = os.path.join(dirpath, fname)
++                    try:
++                        st = os.stat(path)
++                    except OSError:
++                        # Deleted/moved concurrently -- fine, just skip it.
++                        continue
++                    entries.append((st.st_atime, st.st_size, path))
++                    total += st.st_size
++        except OSError:
++            # Directory doesn't exist yet (nothing stored so far) or a
++            # transient error -- next interval will retry.
++            return
++
++        if total <= self._max_disk_bytes:
++            return
++
++        entries.sort(key=lambda e: e[0])  # oldest-accessed first
++        freed = 0
++        deleted = 0
++        for _atime, size, path in entries:
++            if total - freed <= self._max_disk_bytes:
++                break
++            try:
++                os.remove(path)
++            except OSError:
++                # Already gone (e.g. a concurrent eviction pass in a
++                # multi-process deployment sharing root_dir) -- fine.
++                continue
++            freed += size
++            deleted += 1
++
++        logger.warning(
++            "KV offload fs tier: disk cap exceeded (%.2f GiB > %.2f GiB) -- "
++            "evicted %d least-recently-accessed block(s), freed %.2f GiB, "
++            "now approximately %.2f GiB",
++            total / (1024**3),
++            self._max_disk_bytes / (1024**3),
++            deleted,
++            freed / (1024**3),
++            (total - freed) / (1024**3),
++        )
++
+     @override
+     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+         return RequestOffloadingContext()
+@@ -277,5 +404,8 @@
+         Shuts down the lookup manager and the thread pool,
+         clearing pending tasks and waiting for active threads to complete.
+         """
++        self._disk_cap_stop.set()
++        if self._disk_cap_thread is not None:
++            self._disk_cap_thread.join(timeout=5.0)
+         self._lookup_manager.shutdown()
+         self._pool.shutdown(wait=True)

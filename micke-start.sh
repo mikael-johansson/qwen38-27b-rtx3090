@@ -1,11 +1,4 @@
 #!/bin/sh
-# Cap the fs KV-offload cache before starting -- vLLM's FileSystemTierManager
-# has no size limit or eviction of its own (see prune_kv_offload_cache.sh's
-# header and docs/mamba-align-prefill-leak.md's "no disk cap" TODO). This
-# only catches growth between server restarts; for a long-running session,
-# add a cron entry too, e.g.:
-#   */30 * * * * bash $(pwd)/prune_kv_offload_cache.sh
-bash "$(dirname "$0")/prune_kv_offload_cache.sh" /d/nvme_cache/vllm_kv || true
 ITERATION_LOG=1 \
 REQUEST_LOG_DIR=$(pwd)/requests \
 VLLM_LOG_STATS_INTERVAL=1 \
@@ -14,8 +7,19 @@ PREFIX_CACHE=1 \
 CTX=long \
 MAX_LEN=140000 \
 VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file-debug.json \
-EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv"}]}} --enable-cumem-allocator' \
+EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv","max_disk_gib":200}]}} --enable-cumem-allocator' \
 bash single-user/start_qwen.sh
+# max_disk_gib:200 on the fs secondary tier -- patches/fs-tier-disk-cap.patch
+# adds this parameter to vLLM's FileSystemTierManager (no upstream equivalent
+# exists in 0.27.1, unlike the primary CPU tier's cpu_bytes_to_use). A
+# background thread inside the connector itself checks every 2 minutes and
+# evicts the least-recently-accessed *.bin block files (LRU by atime) once
+# usage exceeds 200GiB -- runs continuously for the life of the server, not
+# just at startup, so it actually keeps up with a long-running session
+# (the earlier prune_kv_offload_cache.sh external-script approach only
+# caught growth between restarts, which isn't enough at 200GB/hours-to-days
+# fill rates -- superseded by this, kept in the repo as a manual/one-off
+# tool only). See docs/mamba-align-prefill-leak.md's "no disk cap" section.
 # kv-transfer-config above replaces --kv-offloading-size, with cpu_bytes_to_use
 # at 20GB (host has 32GB total; ~5GB non-offload baseline measured directly).
 # Was 24GB literal, but that measured baseline undercounted real-world

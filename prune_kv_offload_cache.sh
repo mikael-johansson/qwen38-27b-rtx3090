@@ -1,4 +1,14 @@
 #!/bin/bash
+# SUPERSEDED for normal use by patches/fs-tier-disk-cap.patch, which adds
+# continuous, in-process LRU disk capping directly to vLLM's
+# FileSystemTierManager (a background thread inside the server itself,
+# checked every couple of minutes for the life of the process -- see
+# micke-start.sh's "max_disk_gib":200). This external, launch-time-only
+# script can't keep up with a long-running session by itself (it only ever
+# ran once, at server startup) and is kept here only as a manual/one-off
+# cleanup tool -- e.g. to reclaim disk space right now without restarting
+# the server, or for a launch config that doesn't apply the patch above.
+#
 # Cap the KV-offloading fs secondary tier's disk usage, LRU-ish (evicts the
 # least-recently-*accessed* .bin files first, using atime -- confirmed
 # `relatime` is active on the cache filesystem here, so atime is a real,

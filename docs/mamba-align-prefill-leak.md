@@ -717,7 +717,7 @@ manager.py`) was removed before finalizing the patches -- both patch
 files are minimal, confirmed via `patch -p1 -R --dry-run` matching the
 live tree exactly.
 
-### Separate issue surfaced by this investigation: no disk cap on the fs offload tier -- mitigated
+### Separate issue surfaced by this investigation: no disk cap on the fs offload tier -- fixed in-process
 
 `v1/kv_offload/tiering/fs/manager.py`'s `FileSystemTierManager.__init__`
 takes `root_dir`, `n_read_threads`, `n_write_threads`,
@@ -728,27 +728,64 @@ path mapper with no size tracking either. It just writes files to
 `root_dir` forever. This investigation's repeated 88K-token test runs
 filled `/d/nvme_cache` (234G) to 100% over the course of a few hours,
 which is exactly what would eventually happen in normal long-running
-production use too, just slower. No config flag exists to cap it
-(confirmed by reading the full `__init__` signature of both classes and
-the `SecondaryTierFactory` construction path -- any extra key in
-`kv_connector_extra_config.secondary_tiers[...]` besides `type` is
-passed straight through as a kwarg, and there's nothing there to catch a
-size/quota option). This is an upstream vLLM gap, not something to patch
-around in vLLM's own code here.
+production use too, just slower -- at typical rates, 200G is a matter of
+hours to days, not something a launch-time-only check can bound.
 
-**Mitigated 2026-08-22** with `prune_kv_offload_cache.sh` (repo root): an
-external LRU-by-atime pruner (confirmed `relatime` is active on
-`/d/nvme_cache`, so atime is a real, if coarse, recency signal) that caps
-the tier at 200G, pruning down to 180G once triggered. Only deletes
-`*.bin` block files, never the tiny per-run `config.json`. Safe to run
-against a live server -- deleting a block mid-lookup just produces one
-ordinary MISS, which the connector already handles gracefully (confirmed
-throughout this whole investigation, which is full of exactly this kind
-of miss happening for unrelated reasons without incident). Wired into
-`micke-start.sh` as a pre-flight check (catches growth between server
-restarts); for a long-running session, add a cron entry too (exact line
-in `micke-start.sh`'s own comment) since the pre-flight check alone
-doesn't catch growth *during* a session that isn't restarted for days.
+**First attempt (2026-08-22, superseded same day):**
+`prune_kv_offload_cache.sh` (repo root), an *external* LRU-by-atime
+pruner invoked once at server startup from `micke-start.sh`. Works
+correctly as far as it goes, but only ever runs once per server
+lifetime -- it can't keep pace with growth *during* a long-running
+session, which is the actual failure mode. Correctly called out as
+insufficient.
+
+**Fixed properly (2026-08-22)** with
+`patches/fs-tier-disk-cap.patch`: continuous, in-process LRU eviction
+added directly to `FileSystemTierManager` itself. New optional
+`max_disk_gib` / `disk_cap_check_interval_s` constructor kwargs (both
+default to 0/120s -- opt-in, zero behavior change unless configured);
+when set, a dedicated daemon thread (`vllm_kv_fs_disk_cap`) wakes up
+every `disk_cap_check_interval_s` (default 120s) for the entire life of
+the server process and deletes the least-recently-*accessed* (atime)
+`*.bin` block files until usage is back at or under the cap. Runs
+deliberately off the main scheduling thread -- a synchronous check
+hooked into `get_finished_jobs()`/`lookup()` was considered and rejected
+specifically because this investigation had *just* spent hours proving
+how sensitive this exact subsystem is to anything stalling the
+scheduler (see "The suspected hang" section above); a slow-interval
+background thread can't have that failure mode. Safe to race concurrent
+stores/reads/promotions on a live server for the same reason established
+throughout this whole doc -- deleting a block mid-lookup just produces
+one ordinary MISS, which the connector already handles gracefully.
+
+Design reference: CachyLLama's `--cache-ssd-cold-maxsize`
+(`~/git/cachy-fork`, `tools/server/server-context-page-manager.cpp`) --
+same core idea (opt-in byte cap, oldest-first eviction, default
+unlimited), but not its implementation: CachyLLama needs an in-memory
+index of on-disk state and had to separately fix a real bug where that
+index went stale across process restarts (its commit `162663327`).
+vLLM's fs tier has no equivalent index at all -- `os.path.exists()` on a
+deterministic content-hash path *is* the whole lookup mechanism -- so a
+plain filesystem walk is already the correct, restart-safe source of
+truth here, with no bookkeeping to keep in sync. See the patch file's
+own header for the full writeup.
+
+Wired into `micke-start.sh`'s `kv-transfer-config` JSON:
+`"max_disk_gib":200` on the fs `secondary_tiers` entry.
+`prune_kv_offload_cache.sh` is kept in the repo as a manual/one-off
+cleanup tool only (its own header now says so) -- superseded for normal
+use.
+
+**Verified** with a standalone test against the real eviction method
+directly (bypassing full engine/model construction): correctly evicts
+exactly the oldest-atime files down to the cap, no-ops when already
+under it, leaves `config.json` alone, handles a not-yet-existing
+directory without raising, and the background thread's start/stop
+lifecycle joins cleanly with no hang. **Not yet verified against a live,
+model-loaded server** -- this was written and unit-tested while the user
+was about to start their own server to verify the two fixes above, so a
+live run (confirming the startup log line, and ideally an actual
+over-cap eviction) is still outstanding.
 
 ## Reproducing the hang (historical -- only relevant if a hang recurs; both fixes are applied as of 2026-08-22 ~15:30 UTC, see the offloading section above)
 
