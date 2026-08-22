@@ -35,17 +35,19 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
    depending on what the noise turns into. Use real prompts
    (`--dataset-name custom`).
 7. **`--max-num-batched-tokens 8192` still inflates the profiled
-   activation peak** (shrinks the cache pool, caps concurrency) — that
-   part of this entry's old advice stands. The other half doesn't
-   anymore: `--mamba-cache-mode align` used to hit a real vLLM leak in
-   the Mamba/GDN state-freeing check at larger chunk sizes (a single,
-   unopposed large prompt could self-preempt against nothing but its own
-   leak), which is why this entry used to say 1024 beats 2048. That leak
-   is fixed (`patches/mamba-align-stale-state-queue.patch`) — see
-   [docs/mamba-align-prefill-leak.md](mamba-align-prefill-leak.md) for
-   the mechanism and the fix. 8192 itself still isn't safe without
-   raising `--gpu-memory-utilization` headroom first (OOM-crashes the
-   engine, unrelated to the mamba leak).
+   activation peak** (shrinks the cache pool, caps concurrency), and
+   **1024 still beats 2048 for now — the leak fix is reverted.**
+   `--mamba-cache-mode align` has a real vLLM leak in the Mamba/GDN
+   state-freeing check at larger chunk sizes (a single, unopposed large
+   prompt can self-preempt against nothing but its own leak). A fix was
+   written and initially verified, then found to **hang** the server
+   under production config (offloading connector + real concurrency) —
+   reverted 2026-08-22, investigation ongoing. See
+   [docs/mamba-align-prefill-leak.md](mamba-align-prefill-leak.md) before
+   touching `patches/mamba-align-stale-state-queue.patch`. 8192 itself
+   still isn't safe without raising `--gpu-memory-utilization` headroom
+   first either way (OOM-crashes the engine, unrelated to the mamba
+   leak).
 8. **Benchmark twice.** The first run after any restart includes JIT warmup
    and reads 30-50% low.
 9. **`--language-model-only` drops the vision tower cleanly** (no weights

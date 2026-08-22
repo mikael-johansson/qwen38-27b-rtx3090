@@ -1,12 +1,27 @@
 # Mamba-align prefill memory leak (self-preemption on large single prompts)
 
-Investigated and **fixed** 2026-08-21/22, branch `request_logging`. This
-was a real bug in upstream vLLM 0.27.1's `mamba_cache_mode=align`
-implementation, not a config problem in this repo. Fixed in
-`patches/mamba-align-stale-state-queue.patch`; `--max-num-batched-tokens`
-no longer needs to be held down to 1024 to avoid it (that was a
-mitigation, applied and then superseded once the real fix landed -- see
-below for whether `start_qwen.sh` has been reverted to 2048).
+> **STATUS as of 2026-08-22, ~07:35 UTC: fix REVERTED, DO NOT re-apply
+> `patches/mamba-align-stale-state-queue.patch` without reading "The fix
+> caused a production hang" section below first.** The fix correctly
+> eliminates the leak (verified) but caused a real hang under production
+> config (`--max-num-seqs 8` + `--kv-transfer-config` offloading) that
+> wasn't exercised by the verification testing at the time. The live venv
+> currently has the patch reverted -- original leaky-but-safe code is
+> running. Machine was rebooted after this was found (unrelated GPU
+> driver issue from force-killing the hung process, not a fix side
+> effect) -- see that section for exact repro steps and where the
+> investigation was cut off. Read that section fully before touching this
+> patch again.
+
+Investigated 2026-08-21/22, branch `request_logging`. This is a real bug
+in upstream vLLM 0.27.1's `mamba_cache_mode=align` implementation, not a
+config problem in this repo. A fix was written
+(`patches/mamba-align-stale-state-queue.patch`) and initially verified,
+then found to cause a hang under fuller production conditions -- see
+below. Until a corrected fix lands, the safe mitigation remains holding
+`--max-num-batched-tokens` at 1024 (see "Current mitigation" below --
+note this section predates the fix attempt, check `start_qwen.sh`'s
+actual current value rather than assuming).
 
 [← back to the main README](../README.md)
 
@@ -215,7 +230,138 @@ worked around the startup check, but real per-step memory pressure at
 8192 still crashed the engine mid-request -- unrelated to the mamba leak,
 this is pure activation-memory pressure from the larger chunk).
 
-## Reproducing
+## The fix caused a production hang -- REVERTED, not currently applied
+
+Found 2026-08-22, ~07:30 UTC, by the user testing the fix under normal
+production config (`micke-start.sh` → `--max-num-seqs 8`,
+`--kv-transfer-config` with `OffloadingConnector`/`TieringOffloadingSpec`
+-- **not** the `MAX_SEQS=1`, later no-connector, isolated configs the fix
+was verified under above). Symptom: a multi-turn `local_chat_test.py -p
+4000` session froze completely partway through the first turn's prefill
+and never recovered ("it probably won't complete on its own if it's stuck
+in a loop" -- correct).
+
+**Confirmed facts, in order of investigation:**
+
+1. `qwen.log` showed the request frozen at exactly 11.1% GPU-KV usage,
+   heartbeat lines (`loggers.py:468`) ticking once per second forever
+   with `Avg prompt throughput: 0.0 tokens/s`, no new `gpu_model_runner.py
+   Running batch` line after the freeze point -- the forward-pass loop
+   had stopped issuing steps entirely.
+2. The freeze started immediately after `Request X offloading 5 chunks
+   upto 6656 tokens (job 3)` -- i.e. right as the 4th offload job for
+   this request was queued, very early in prefill.
+3. `ps`/`top` showed the `VLLM::EngineCore` process at **100% CPU,
+   state R (actively running, not blocked/sleeping)** -- this is a
+   genuine busy-loop, not a deadlock waiting on I/O or a lock, and not a
+   crash.
+4. `patches/discard-unoffloaded-kv-warning.patch`'s new code
+   (`_warn_if_discarding_unoffloaded_kv`) only runs from
+   `_free_request_blocks()`, which only fires on request finish/abort/
+   preemption. The last such call in `qwen.log` was ~6.5 minutes *before*
+   the freeze started, and none occurred during it -- **ruled out** as
+   the cause.
+5. That leaves `patches/mamba-align-stale-state-queue.patch`'s
+   `remove_skipped_blocks()` change, which runs on *every scheduling
+   step* (not just at finish time) -- the prime suspect by elimination.
+6. Checked `distributed/kv_transfer/kv_connector/v1/offloading/
+   scheduler.py` directly: Mamba/GDN KV-cache groups **are** included in
+   the offloading connector's tracked groups
+   (`resolve_mamba_align_size()` scans all groups including Mamba ones),
+   and the connector's own store-job logic explicitly handles "null
+   placeholder blocks used for sliding window or mamba padding" -- so
+   Mamba blocks are genuinely part of in-flight offload jobs, not just
+   attention blocks.
+
+**Working hypothesis, not yet confirmed by a stack trace:** the queue fix
+makes Mamba state blocks get freed far earlier and far more often than
+the original (effectively-never-frees-during-prefill) code ever did.
+Unlike the *scheduler*-level preemption fix
+(`patches/preemption-defer-block-free.patch`, `_free_request_blocks(...,
+force_defer=...)`), which explicitly defers freeing a preempted request's
+blocks until the connector's `jobs_to_flush` for that request have
+drained, this per-step Mamba freeing path lives deep inside
+`SingleTypeKVCacheManager` / `KVCacheManager.allocate_slots()` and has
+**no equivalent guard** against freeing a block that's still part of an
+in-flight offload job. The connector does have its own protection for
+this in general (`_block_id_to_pending_jobs`, triggering a flush when a
+pending-job block is about to be *reused*) -- but that's triggered from
+the allocation side, and it's plausible the interaction with freeing from
+this specific, newly-exercised path leaves some tracking structure
+inconsistent, causing a wait/retry loop that spins forever instead of
+resolving. **This was not confirmed with a live stack trace** -- `py-spy`
+had to be installed fresh and then couldn't attach without root
+(`ptrace_scope=1`, process wasn't a direct child, no sudo password
+available in the session). Getting an actual stack trace of the spinning
+`VLLM::EngineCore` process (`sudo py-spy dump --pid <pid>`, or `sudo
+gdb -p <pid>` with the python extension, `py-bt`) while it's hung is the
+single highest-value next step -- it would turn this from a hypothesis
+into a confirmed root cause.
+
+**Action taken:** reverse-applied `patches/mamba-align-stale-state-queue.
+patch` against the live venv (`single_type_kv_cache_manager.py`) --
+confirmed via `grep -c _stale_state_block_idxs` returning 0 after the
+revert. Original scalar `last_state_block_idx` code (leaky but hang-free)
+is what's live. `patches/discard-unoffloaded-kv-warning.patch` was left
+applied (ruled out above, and independently useful). **The revert was not
+re-verified to fix the hang before the machine had to be rebooted** for
+an unrelated reason (GPU stuck at ~23.6GB used after force-killing the
+hung process -- `fuser`/process list showed nothing holding it, driver-
+level cleanup issue from the cumem allocator not releasing on SIGKILL,
+needed a reboot to clear).
+
+**Next steps in order:**
+1. After reboot, confirm GPU is clear (`nvidia-smi`) and confirm the
+   revert is still in place in the venv (`grep -c _stale_state_block_idxs
+   venv/lib/python3.12/site-packages/vllm/v1/core/single_type_kv_cache_manager.py`
+   should print `0`) -- reboot shouldn't have touched it (it's a live
+   edit to installed package files, not a running process), but verify.
+2. Re-run the exact repro (multi-turn `local_chat_test.py -p 4000`
+   against a `micke-start.sh`-launched server, i.e.
+   `--max-num-seqs 8` + offloading) with the fix reverted, to confirm the
+   hang is actually gone with the original code -- this hasn't been
+   directly confirmed yet, only inferred from reverting the prime
+   suspect.
+3. If confirmed gone: get a real stack trace of the *fixed* code hanging
+   (re-apply the patch, reproduce again, `sudo py-spy dump`) to nail the
+   exact mechanism before attempting a corrected fix.
+4. The corrected fix likely needs the Mamba per-step freeing path to
+   either (a) consult `_block_id_to_pending_jobs` (or equivalent) before
+   calling `block_pool.free_blocks()`, deferring like the preemption fix
+   does, or (b) not call `free_blocks()` directly from this layer at all
+   and instead route through whatever mechanism the scheduler-level fix
+   uses. Needs someone to trace how `_block_id_to_pending_jobs` gets
+   populated/consumed and whether `SingleTypeKVCacheManager` even has a
+   handle on the connector to check it from -- it may not, structurally,
+   which would mean the real fix has to move up a layer.
+
+## Reproducing the hang (current priority)
+
+```
+bash micke-start.sh
+```
+(normal production config: `--max-num-seqs 8`, `--kv-transfer-config`
+with `OffloadingConnector`/`TieringOffloadingSpec`, `CTX=long`,
+`MAX_LEN=140000` -- this is the config that hung; the isolated
+`MAX_SEQS=1` / no-connector configs used to verify the fix originally did
+**not** reproduce it)
+
+Then, against a fresh server, a genuine multi-turn session (not a single
+solo probe):
+```
+printf "Please summarize the key themes in the reference material above in about 3 sentences.\nThanks - now, in one sentence, what did you just say?\n" \
+  | venv/bin/python local_chat_test.py -p 4000
+```
+
+Watch `qwen.log` for `Avg prompt throughput: 0.0 tokens/s` heartbeat
+lines repeating with a frozen `GPU KV cache usage` and no new
+`gpu_model_runner.py Running batch` lines -- that's the freeze. Confirm
+with `top`/`ps` that the `VLLM::EngineCore` process is pinned at 100% CPU
+in state `R` (busy-loop, not blocked). This requires
+`patches/mamba-align-stale-state-queue.patch` to be **applied** (it's
+reverted by default right now -- see status banner at the top).
+
+## Reproducing the original memory leak
 
 ```
 MAX_SEQS=1 ITERATION_LOG=1 VLLM_LOG_STATS_INTERVAL=1 PREFIX_CACHE=1 \
@@ -225,16 +371,18 @@ EXTRA_ARGS='--enable-auto-tool-choice --tool-call-parser qwen3_xml --enable-cume
 bash single-user/start_qwen.sh
 ```
 (omit `--kv-transfer-config` / offloading to isolate from that connector
-entirely -- confirmed the leak is unrelated to it)
+entirely -- confirmed the leak itself is unrelated to it, independent of
+the hang)
 
 Then, against a fresh server:
 ```
 echo "..." | venv/bin/python local_chat_test.py -p 4000
 ```
 
-To reproduce the *original* (pre-fix) bug rather than confirm the fix,
-revert `patches/mamba-align-stale-state-queue.patch` before starting the
-server.
+This is what the fix (when it worked) resolved. The patch is currently
+reverted, so this config will currently show the original leak/
+self-preemption behavior, not the hang -- the hang needs the offloading
+connector + real concurrency, per the section above.
 
 Diagnostic patches (apply on top of the base patch set, quiet by default
 -- gated on free blocks < 15% of pool, so normal short-prompt traffic
