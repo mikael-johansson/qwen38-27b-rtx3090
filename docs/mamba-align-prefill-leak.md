@@ -1,27 +1,30 @@
 # Mamba-align prefill memory leak (self-preemption on large single prompts)
 
-> **STATUS as of 2026-08-22, ~07:35 UTC: fix REVERTED, DO NOT re-apply
-> `patches/mamba-align-stale-state-queue.patch` without reading "The fix
-> caused a production hang" section below first.** The fix correctly
-> eliminates the leak (verified) but caused a real hang under production
-> config (`--max-num-seqs 8` + `--kv-transfer-config` offloading) that
-> wasn't exercised by the verification testing at the time. The live venv
-> currently has the patch reverted -- original leaky-but-safe code is
-> running. Machine was rebooted after this was found (unrelated GPU
-> driver issue from force-killing the hung process, not a fix side
-> effect) -- see that section for exact repro steps and where the
-> investigation was cut off. Read that section fully before touching this
-> patch again.
+> **STATUS as of 2026-08-22, ~13:40 UTC: fix REVERTED, DO NOT re-apply
+> `patches/mamba-align-stale-state-queue.patch`.** The leak fix itself
+> is correct and well-verified, but it has a **precisely characterized,
+> unresolved interaction with KV offloading** that only shows up at
+> `--max-num-batched-tokens 2048` (the batch size we actually want to
+> run at) -- see "The fix breaks KV offloading at 2048" below for the
+> full root-cause writeup, including a fast (~4 min) reliable repro
+> (`bash test_offload_regression.sh`) and everything that was ruled out
+> along the way. **1024 is not a real fix** (throughput/concurrency
+> regression) -- it's mentioned below only as a diagnostic data point
+> that happens to also avoid this bug. Original scalar
+> `last_state_block_idx` code (leaky, but both hang-free and
+> offload-safe at any batch size) is what's live as of this update.
 
 Investigated 2026-08-21/22, branch `request_logging`. This is a real bug
 in upstream vLLM 0.27.1's `mamba_cache_mode=align` implementation, not a
 config problem in this repo. A fix was written
-(`patches/mamba-align-stale-state-queue.patch`) and initially verified,
-then found to cause a hang under fuller production conditions -- see
-below. Until a corrected fix lands, the safe mitigation remains holding
-`--max-num-batched-tokens` at 1024 (see "Current mitigation" below --
-note this section predates the fix attempt, check `start_qwen.sh`'s
-actual current value rather than assuming).
+(`patches/mamba-align-stale-state-queue.patch`) that correctly eliminates
+the leak itself (verified, see "The fix" below), but every time it's been
+tried under fuller production conditions (real concurrency, offloading
+enabled) it has broken something else -- first an apparent hang (turned
+out to be PSU-related, see below, not the fix), then a confirmed,
+precisely-diagnosed-but-still-unresolved KV-offloading interaction (see
+"The fix breaks KV offloading at 2048" below). It is **not currently safe
+to apply**.
 
 [← back to the main README](../README.md)
 
@@ -230,7 +233,81 @@ worked around the startup check, but real per-step memory pressure at
 8192 still crashed the engine mid-request -- unrelated to the mamba leak,
 this is pure activation-memory pressure from the larger chunk).
 
-## The fix caused a production hang -- REVERTED, not currently applied
+## The suspected hang -- re-tested clean after a hardware fix (this part held up)
+
+**Note:** this section's conclusion (hang was PSU, not the fix) has held
+up fine -- it's the *next* section ("The fix breaks KV offloading") that
+found the actual reason the fix can't be applied yet. Keeping this
+section as-is for the record.
+
+**Update 2026-08-22, ~10:15 UTC:** after the machine was rebooted for an
+unrelated GPU fault (Xid 154, "Node Reboot Required" -- hit mid-retest,
+see the incident note below), the user identified the actual cause as a
+**failing PSU**, since fixed. With that hardware issue addressed, the
+exact hang repro from the section below was re-run from a clean restart
+(fresh `micke-start.sh`, `--max-num-seqs 8` + `OffloadingConnector`, fix
+patch applied) and did **not** reproduce:
+
+- Multi-turn `local_chat_test.py -p 4000` repro, run twice: both times
+  completed cleanly end to end (turn 1 ttfb~100s as expected for an 88K
+  prompt, turn 2 ttfb~3-5s off a strong prefix-cache hit -- no
+  reprocessing, no freeze). `qwen.log` showed `Running: 0 reqs` shortly
+  after each turn's generation ended, not a stuck heartbeat.
+- Two concurrent solo 88K-token prompts (the scenario that used to
+  self-preempt against the pool, matching what was captured in
+  `qwen.log` right at reboot, under the *original leaky* code): both
+  completed with **zero preemptions each** (`num_preemptions=0` in the
+  `_free_request_blocks` trace for both), peak GPU-KV usage **55.6%**
+  even with two 88K prompts in flight simultaneously -- a single 88K
+  prompt alone used to peak the pool at 99.6% under the old leaky code.
+
+No hang, no stuck heartbeat lines, no CPU-pinned `VLLM::EngineCore`
+across 4 separate runs. This is the same repro that froze solid before
+the reboot (frozen at 11.1% GPU-KV usage, `VLLM::EngineCore` at 100% CPU
+in state `R`, per the original writeup preserved below).
+
+**This does not conclusively rule out the original hypothesis** (a race
+between the per-step Mamba freeing path and the offloading connector's
+in-flight job tracking, described below) -- the hang was never actually
+caught with a stack trace, so there's no proof it was the PSU rather
+than the fix. But given: (a) a dying PSU under sustained GPU load is a
+plausible, independently-confirmed-real cause of exactly this kind of
+symptom (a wedged process that looks like a busy-loop rather than a
+clean crash), (b) the user identified and fixed a real PSU problem
+around the same time, and (c) 4/4 clean re-runs of the exact repro
+afterward, the balance of evidence now favors "hardware, not the fix."
+**Action taken:** re-applied `patches/mamba-align-stale-state-queue.patch`
+to the live venv (confirmed via `grep -c _stale_state_block_idxs`
+returning non-zero). The fix is live as of this update.
+
+**If a hang like this happens again** (frozen heartbeat, `GPU KV cache
+usage` stuck, `VLLM::EngineCore` pinned at 100% CPU in state `R`, no new
+`Running batch` lines): that would be much stronger evidence the fix
+really does have the race described below, now that a hardware
+explanation has been tested and didn't reproduce it. Two things are now
+in place to make that diagnosis faster next time, in case it does:
+- `venv/lib/python3.12/site-packages/sitecustomize.py` was added (not a
+  vLLM patch, a venv-local file, so it won't show up in `git diff`
+  against the patches) -- it registers a `SIGUSR1` handler via
+  `faulthandler` on every Python process started from this venv,
+  including `VLLM::EngineCore`. If it hangs again: find the EngineCore
+  PID (`ps aux | grep VLLM::EngineCore`), `kill -USR1 <pid>`, then read
+  `/tmp/vllm_faulthandler_dump.txt` for a full all-threads Python
+  traceback -- no `sudo`/`py-spy`/`ptrace_scope` needed, this works as
+  the same unprivileged user. This is the single highest-value tool for
+  actually confirming or killing the race hypothesis below.
+- `py-spy` was pip-installed into the venv in the prior session but
+  couldn't attach without root; the `sitecustomize.py` hook above is a
+  better fit for this environment (no `ptrace_scope`/sudo dependency) and
+  should be tried first.
+
+The original hang investigation from the pre-reboot session is preserved
+below verbatim for context (the working hypothesis about the offloading
+connector race is unconfirmed either way -- neither proven nor
+disproven by today's clean re-runs, since a hardware fault could easily
+have been masking or mimicking it).
+
+### Original hang writeup (pre-reboot, PSU issue not yet identified)
 
 Found 2026-08-22, ~07:30 UTC, by the user testing the fix under normal
 production config (`micke-start.sh` → `--max-num-seqs 8`,
@@ -310,41 +387,300 @@ hung process -- `fuser`/process list showed nothing holding it, driver-
 level cleanup issue from the cumem allocator not releasing on SIGKILL,
 needed a reboot to clear).
 
-**Next steps in order:**
-1. After reboot, confirm GPU is clear (`nvidia-smi`) and confirm the
-   revert is still in place in the venv (`grep -c _stale_state_block_idxs
-   venv/lib/python3.12/site-packages/vllm/v1/core/single_type_kv_cache_manager.py`
-   should print `0`) -- reboot shouldn't have touched it (it's a live
-   edit to installed package files, not a running process), but verify.
-2. Re-run the exact repro (multi-turn `local_chat_test.py -p 4000`
-   against a `micke-start.sh`-launched server, i.e.
-   `--max-num-seqs 8` + offloading) with the fix reverted, to confirm the
-   hang is actually gone with the original code -- this hasn't been
-   directly confirmed yet, only inferred from reverting the prime
-   suspect.
-3. If confirmed gone: get a real stack trace of the *fixed* code hanging
-   (re-apply the patch, reproduce again, `sudo py-spy dump`) to nail the
-   exact mechanism before attempting a corrected fix.
-4. The corrected fix likely needs the Mamba per-step freeing path to
+**Next steps in order (as planned pre-reboot -- steps 1-2 are now DONE,
+see the update above; kept here for the historical record):**
+1. ~~After reboot, confirm GPU is clear and confirm the revert is in
+   place.~~ Done.
+2. ~~Re-run the exact repro with the fix reverted, to confirm the hang is
+   actually gone with the original code.~~ Superseded: the PSU was
+   identified as the likely real cause before this step happened, so
+   instead the fix was re-applied and *the fix itself* was re-tested
+   (see update above) -- it came back clean 4/4, so this step never
+   ended up being needed to isolate the variable.
+3. Still open, only relevant **if a hang recurs**: get a real stack trace
+   while it's hung. Now doable without root or `py-spy` -- see the
+   `sitecustomize.py` / `SIGUSR1` / `faulthandler` mechanism described in
+   the update above (`kill -USR1 <EngineCore pid>`, read
+   `/tmp/vllm_faulthandler_dump.txt`).
+4. Still open, only relevant if step 3 ever confirms a real race: the
+   corrected fix would likely need the Mamba per-step freeing path to
    either (a) consult `_block_id_to_pending_jobs` (or equivalent) before
    calling `block_pool.free_blocks()`, deferring like the preemption fix
    does, or (b) not call `free_blocks()` directly from this layer at all
    and instead route through whatever mechanism the scheduler-level fix
-   uses. Needs someone to trace how `_block_id_to_pending_jobs` gets
-   populated/consumed and whether `SingleTypeKVCacheManager` even has a
-   handle on the connector to check it from -- it may not, structurally,
-   which would mean the real fix has to move up a layer.
+   uses.
 
-## Reproducing the hang (current priority)
+## The fix breaks KV offloading at 2048 -- REVERTED, root cause narrowed but not fixed
+
+Found 2026-08-22, ~11:00 UTC, extensively re-investigated same day through
+~13:40 UTC. After the hang was provisionally cleared (previous section),
+the fix was re-applied and left running in production. The user then
+reported: *"RAM/Disk offloading doesn't seem to work anymore... tons of
+reprocessing when everything should be in cache."* This is a **different
+bug from the hang** -- no freeze, no stuck heartbeat, the engine makes
+normal progress throughout -- but a multi-turn conversation that should
+get a fast RAM/NVMe cache hit instead does a full, ~100-second-per-88K-
+tokens reprocess from scratch. This directly explains why the *original*
+pre-reboot report ("we are now _re-processing_ prompts _after_ the reply
+is finished") looked like an infinite loop: a full reprocess of an 88K
+prompt just looks like a stall if you're not watching the token counter.
+
+**Bottom line up front:** this is real, 100% reproducible, and now
+precisely characterized -- but not yet fixed. It is specifically tied to
+`--max-num-batched-tokens`: broken at 2048 (what we want), works at 1024
+(not an acceptable fix -- see the repo's own throughput numbers for why
+1024 was the thing we were trying to get away from). A large amount of
+work went into ruling out simpler explanations one at a time; each is
+recorded below because re-deriving them cost real time and they are all
+non-obvious.
+
+### Fast, reliable repro
+
+`test_offload_regression.sh` (repo root). Runs 2 sequential 88K-token
+conversations against a running server -- conv A turn 1, then conv B
+turn 1 (big enough that B evicts A's GPU-local prefix cache), then conv A
+turn 2, which should be served from the RAM/NVMe offload tier if
+offloading is working:
+
+```
+bash micke-start.sh                    # or whatever config you're testing
+# wait for /health, then:
+bash test_offload_regression.sh
+```
+
+**Working** (fix reverted, OR fix applied at `--max-num-batched-tokens
+1024`): conv A turn 2 finishes in **4.6-8s**, and `qwen.log` shows the
+connector's own hit-confirmation line, e.g. `Request chatcmpl-... hit
+85696 offloaded tokens after 0 GPU hit tokens`, confirmed by GPU-KV usage
+having hit 100% in between (so it wasn't just a lucky local-cache
+survival, it's a genuine external hit).
+
+**Broken** (fix applied at the default `--max-num-batched-tokens 2048`):
+conv A turn 2 takes **~100-105s** (identical throughput to a cold
+first-turn prefill), and `qwen.log` has **zero** `"offloaded tokens
+after"` lines for that request. Total miss, every time. Reproduced well
+over a dozen times across this investigation -- 100% reliable at 2048,
+100% working at 1024, not intermittent either way.
+
+### What it is not (each ruled out with a dedicated, isolated test)
+
+- **Not disk exhaustion.** `/d/nvme_cache` genuinely did fill to 100%
+  during this investigation (the fs secondary tier has no size cap or
+  eviction at all -- see the new TODO item at the bottom of this doc) and
+  caused real `[Errno 28] No space left on device` errors for a while,
+  which looked like a plausible cause. But the failure reproduces
+  identically with the disk freshly cleared (16K used / 222G free) --
+  disk pressure was a real, separate bug (worth fixing on its own) that
+  happened to overlap in time, not the cause of this one.
+- **Not a free-before-store race.** Instrumented the connector's
+  `_build_store_jobs()` at its `if block_id == 0: continue` skip point
+  (the only place a freed/nulled Mamba block could make a chunk
+  unstorable) directly: **zero skips**, for either Mamba or attention
+  groups, across every test run. The physical bytes are always
+  successfully captured before anything reuses that GPU memory.
+- **Not free-vs-store timing/margin, at any margin.** Tried holding back
+  the newest 1, and then the newest 20, pending stale-block entries
+  before ever calling `block_pool.free_blocks()` on them (i.e.
+  progressively more conservative versions of "wait before freeing").
+  **Zero effect** on the outcome at either margin -- still a total miss
+  every time at 2048. This rules out any theory shaped like "the fix
+  frees a block N steps too early."
+- **Not block-hash assignment timing.** Hypothesis: `cache_blocks()`
+  (which assigns `block.block_hash`, and runs from `AsyncScheduler.
+  _update_request_with_output()` -- triggered when a step's GPU results
+  return, a separate and *later* event than `processed_computed_tokens`
+  crossing a block's boundary) might not have run yet for a block by the
+  time our fix frees it, corrupting the hash chain the connector's
+  offload keys derive from. Gated freeing on `block.block_hash is not
+  None` directly (the precise, unambiguous version of this check, not a
+  proxy). **Zero effect** -- still fails identically. So either the hash
+  is already assigned by the time our check runs, or this isn't the
+  mechanism.
+- **Not the switch from a scalar to a list, independent of freeing
+  behavior.** Kept the new `_stale_state_block_idxs: dict[str, list[int]]`
+  tracking structure, but made the actual freeing behave byte-for-byte
+  like the original scalar (only ever consider the single newest entry,
+  clear everything else, matching the original's "never actually frees
+  during continuous prefill" behavior). This **worked** (fast hit) at
+  2048 -- but this only proves "freeing nothing beyond what the original
+  code froze" is safe, which is a tautology (it's not exercising the fix
+  at all). See the next point for why this doesn't mean margin-based
+  throttling is the fix either.
+
+### What it is: tied to chunk size, not to any freeing condition
+
+The decisive experiment: run the **actual, unthrottled fix** (frees a
+block the instant it's safely stale, no artificial margin) at
+`--max-num-batched-tokens 1024` instead of 2048. Result: **works**
+(`hit 86528 offloaded tokens`, 6s turn-2). Same fix code, only the batch
+size changed. So:
+
+| | 1024 | 2048 |
+|---|---|---|
+| Leak fixed (peak GPU-KV usage) | yes | yes |
+| Offloading works | **yes** | **no** |
+
+This rules out every freeing-condition theory above at once (they'd have
+to also explain why the *identical* freeing logic works fine at 1024) and
+points somewhere else: **the interaction is with request throughput /
+scheduling-step frequency, not with any per-block timing decision our
+code makes.**
+
+Direct evidence for the mechanism, from tagging the connector's own
+per-group lookup result (`_lookup()`'s `num_hit_chunks`, scheduler.py
+~702-729) with `group_idx` and comparing the *same* request side by side:
+
+```
+# WORKING (fix reverted, 2048):
+group_idx=3 (attention)  -> 105/106 hit
+group_idx=0 (mamba)      -> 104/105 hit   <- one chunk short, same as always
+group_idx=1 (mamba)      -> 104/104 hit
+group_idx=2 (mamba)      -> 104/104 hit
+
+# BROKEN (fix applied, 2048):
+group_idx=3 (attention)  -> 105/106 hit   <- identical to the working case
+group_idx=0 (mamba)      -> 0/105 hit     <- clean, total miss
+```
+
+Full-attention's own lookup is **identical** in both cases (105/106,
+tolerating one unresolved/pending trailing chunk fine -- its
+`_maximal_prefix_lookup` just returns however much of a run it confirmed).
+Mamba's lookup goes through `_sliding_window_lookup()` instead (window
+size 1, since Mamba groups get `sliding_window_size_in_chunks=1`
+regardless of `mamba_cache_mode` -- see `get_sliding_window_size_in_chunks()`,
+scheduler.py:107). That function scans backward and does **not** break on
+a `RETRY` result (deliberately, "to let manager kick off async lookups") --
+but critically, if *any* entry newer than a later confirmed hit came back
+`RETRY`, the whole scan's result is discarded to `None` (deferred)
+regardless of the hit (`return idx + sliding_window_size if not
+defer_lookup else None`, scheduler.py:609). So Mamba's lookup has **zero
+tolerance** for an unsettled recent chunk, where attention's has
+essentially unlimited tolerance (one confirmed run is enough, however far
+back).
+
+Mamba's own align-mode block churn is **step-count-driven, not
+token-count-driven**: `allocate_new_blocks()`'s align-mode branch grants
+`num_new_blocks = 1` per group per scheduling step, hardcoded, regardless
+of `--max-num-batched-tokens` (see "Why chunk size determines..." above).
+At 2048 vs. 1024, roughly the same wall-clock throughput (~800-900 tok/s)
+is achieved with **half as many, twice-as-big scheduling steps** -- so
+Mamba's per-*step* churn rate is unchanged, but the number of
+opportunities-per-second for whatever polls/settles the offloading
+connector's async promotion pipeline (`TieringOffloadingManager.
+_maybe_process_finished_jobs()`, gated to run at most once per step) is
+roughly **halved**. The working theory, not yet proven down to the exact
+stall: at 2048 the async promotion pipeline doesn't get polled often
+enough (in real time) to keep pace with Mamba's step-driven churn, so its
+newest 1-2 chunks are still showing `RETRY` (promotion in flight, not yet
+confirmed) at the exact moment a fresh request's lookup scans them --
+and because of the zero-tolerance behavior above, that alone sinks the
+*entire* Mamba group's result, discarding an otherwise-fine hit found
+further back. Full-attention's own chunks presumably hit the same
+`RETRY` states sometimes too, but its lookup tolerates them fine.
+
+This was directly observed once, per-key, before the group-level
+comparison above made it unnecessary to keep digging further: for one
+`RETRY`-heavy scan, indices 105 and 104 (the two newest) returned `RETRY`,
+then index 103 returned a clean `HIT` -- and the function's own semantics
+discarded the result to `None` anyway because of the two RETRYs ahead of
+it (see the code excerpt above). On a *later* rescan (after the query
+window had narrowed following the attention group's own successful
+lookup), index 104 had settled to a clean `MISS` and index 103 was still
+`HIT` -- but by then the query window had already been narrowed past 105
+by the outer loop, and the group as a whole still failed for other
+reasons visible only in the full trace. The exact stall was not chased
+further than this once the batch-size experiment above made the
+higher-level mechanism (step-frequency-driven polling vs. token-count-driven
+churn) clear enough to stop guessing at the last mile.
+
+### What was NOT the cause (revised from an earlier, wrong hypothesis)
+
+An earlier version of this section hypothesized a same-scheduling-step
+race between our fix's `block_pool.free_blocks()` call (in
+`allocate_slots()`, which runs before `build_connector_meta()` within
+`Scheduler.schedule()`) and the connector's store-job builder seeing a
+null block. Directly instrumented and **disproven**: zero
+`block_id == 0` skips ever observed in `_build_store_jobs()`, at any
+margin, in any run. That whole theory is wrong; left here so it isn't
+re-derived and re-disproven again.
+
+### Action taken
+
+Reverted to the original scalar `last_state_block_idx` code (confirmed
+via `grep -c _stale_state_block_idxs` returning 0). `single-user/
+start_qwen.sh` is back at `--max-num-batched-tokens 2048` (it was
+temporarily flipped to 1024 for the diagnostic experiment above and
+restored via `git checkout`). Debug instrumentation added during this
+investigation (temporary `print()` calls in `single_type_kv_cache_manager.py`,
+`distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py`, and
+`v1/kv_offload/tiering/manager.py`) was all removed -- those three files
+should currently match pristine upstream 0.27.1 plus the *other*,
+unrelated patches in `patches/`.
+
+### Next steps for whoever picks this up
+
+1. Use `test_offload_regression.sh` for fast iteration (~4 min per
+   attempt). The batch-size table above is the fastest way to confirm
+   you're still looking at the same bug (broken at 2048, working at
+   1024, with the *unthrottled* fix applied both times).
+2. The remaining gap is the exact stall: why the async promotion
+   pipeline's step-gated polling (`_maybe_process_finished_jobs`,
+   `TieringOffloadingManager`) falls behind specifically at 2048. This
+   needs re-instrumenting `_sliding_window_lookup()`
+   (scheduler.py, tag with `group_idx` and `req_id`) and correlating
+   against `_process_finished_jobs()` / `_flush_pending_promotions()`
+   timing (`v1/kv_offload/tiering/manager.py`) across both batch sizes,
+   watching specifically for whether promotions get *submitted* less
+   often at 2048 (fewer steps -> fewer `on_schedule_end()` calls -> fewer
+   `_flush_pending_promotions()` calls) or *completed* less often
+   (thread-pool contention, though the fs tier's 16+16 threads make raw
+   thread starvation unlikely) per unit wall-clock time.
+3. If confirmed as "the connector's per-step polling cadence can't keep
+   up at low step-frequency," candidate fixes are all at the *connector*
+   level, not in `single_type_kv_cache_manager.py`: e.g. polling more
+   than once per step when steps are large, or making
+   `_sliding_window_lookup()`'s zero-tolerance-for-RETRY behavior more
+   forgiving specifically when a later (older) index already resolved to
+   a clean HIT. Both are deep, unfamiliar, performance-sensitive vLLM
+   internals (`v1/kv_offload/tiering/`) -- change them carefully and
+   re-verify with `test_offload_regression.sh` at 2048 specifically, not
+   just the leak-fix's own peak-usage numbers.
+4. Alternatively: if this turns out to be a genuine upstream vLLM
+   limitation (align-mode Mamba's zero-tolerance sliding-window lookup
+   combined with step-driven churn), it may be worth reporting upstream
+   rather than patching around it here -- it would affect any align-mode
+   Mamba + KV-offloading deployment at large batch sizes, not just this
+   repo.
+
+### Separate TODO surfaced by this investigation: no disk cap on the fs offload tier
+
+`v1/kv_offload/tiering/fs/manager.py`'s `FileSystemTierManager.__init__`
+takes `root_dir`, `n_read_threads`, `n_write_threads`,
+`enable_kv_events`, `locality` -- **no size limit, no eviction policy**,
+unlike the primary CPU tier (`cpu_bytes_to_use`, LRU/ARC eviction). It
+just writes files to `root_dir` forever. This investigation's repeated
+88K-token test runs filled `/d/nvme_cache` (234G) to 100% over the
+course of a few hours, which is exactly what would eventually happen in
+normal long-running production use too, just slower. No config flag
+exists to cap it today (confirmed by reading the full `__init__`
+signature and its `SecondaryTierFactory` construction path -- any extra
+key in `kv_connector_extra_config.secondary_tiers[...]` besides `type`
+gets passed straight through as a kwarg, and there's nothing to catch).
+Worth a follow-up: either an upstream vLLM feature (real size-based LRU
+eviction for the fs tier, mirroring the primary tier's), or in the
+meantime an external prune script/cron/systemd-timer against `root_dir`
+as a practical mitigation.
+
+## Reproducing the hang (historical -- only relevant if a hang recurs; the fix is reverted as of 2026-08-22 ~13:40 UTC, see the offloading section above)
 
 ```
 bash micke-start.sh
 ```
 (normal production config: `--max-num-seqs 8`, `--kv-transfer-config`
 with `OffloadingConnector`/`TieringOffloadingSpec`, `CTX=long`,
-`MAX_LEN=140000` -- this is the config that hung; the isolated
-`MAX_SEQS=1` / no-connector configs used to verify the fix originally did
-**not** reproduce it)
+`MAX_LEN=140000` -- this is the config that *appeared* to hang once,
+pre-PSU-fix; the isolated `MAX_SEQS=1` / no-connector configs used to
+verify the fix originally did **not** reproduce it either way)
 
 Then, against a fresh server, a genuine multi-turn session (not a single
 solo probe):
@@ -357,9 +693,15 @@ Watch `qwen.log` for `Avg prompt throughput: 0.0 tokens/s` heartbeat
 lines repeating with a frozen `GPU KV cache usage` and no new
 `gpu_model_runner.py Running batch` lines -- that's the freeze. Confirm
 with `top`/`ps` that the `VLLM::EngineCore` process is pinned at 100% CPU
-in state `R` (busy-loop, not blocked). This requires
-`patches/mamba-align-stale-state-queue.patch` to be **applied** (it's
-reverted by default right now -- see status banner at the top).
+in state `R` (busy-loop, not blocked). Re-run 2026-08-22 (~10:15 UTC)
+with `patches/mamba-align-stale-state-queue.patch` applied and it
+completed cleanly twice in a row, plus a two-concurrent-88K-prompt
+variant with zero preemptions -- see "The suspected hang" section above
+for exact numbers. The patch is reverted again now (see the offloading
+section above), for an unrelated reason -- the hang itself has not
+recurred. If `kill -USR1 <EngineCore pid>` + reading
+`/tmp/vllm_faulthandler_dump.txt` is ever needed, the handler is
+registered via `venv/lib/python3.12/site-packages/sitecustomize.py`.
 
 ## Reproducing the original memory leak
 
