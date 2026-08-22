@@ -1,30 +1,33 @@
 # Mamba-align prefill memory leak (self-preemption on large single prompts)
 
-> **STATUS as of 2026-08-22, ~13:40 UTC: fix REVERTED, DO NOT re-apply
-> `patches/mamba-align-stale-state-queue.patch`.** The leak fix itself
-> is correct and well-verified, but it has a **precisely characterized,
-> unresolved interaction with KV offloading** that only shows up at
-> `--max-num-batched-tokens 2048` (the batch size we actually want to
-> run at) -- see "The fix breaks KV offloading at 2048" below for the
-> full root-cause writeup, including a fast (~4 min) reliable repro
-> (`bash test_offload_regression.sh`) and everything that was ruled out
-> along the way. **1024 is not a real fix** (throughput/concurrency
-> regression) -- it's mentioned below only as a diagnostic data point
-> that happens to also avoid this bug. Original scalar
-> `last_state_block_idx` code (leaky, but both hang-free and
-> offload-safe at any batch size) is what's live as of this update.
+> **STATUS as of 2026-08-22, ~15:30 UTC: FIXED. Both patches applied and
+> verified at the default `--max-num-batched-tokens 2048`:**
+> `patches/mamba-align-stale-state-queue.patch` (the leak fix) **and**
+> `patches/offload-eagle-misclassification-mamba.patch` (fixes the KV-
+> offloading regression the leak fix exposed -- a real, separate bug in
+> the connector, not in the leak fix itself). See "The fix breaks KV
+> offloading at 2048 -- root cause found and fixed" below for the full
+> story, including everything that was ruled out along the way (kept for
+> the record so it isn't re-derived). Verified: `test_offload_regression.sh`
+> passes reliably, 2x concurrent ~88K-token prompts complete with zero
+> preemptions, and a 3x concurrent ~120K-token stress test (360K tokens
+> of combined demand against a ~172K-token pool) completes with zero
+> preemptions and zero discarded/never-offloaded KV cache. `--max-num-
+> batched-tokens` no longer needs to be held at 1024.
 
-Investigated 2026-08-21/22, branch `request_logging`. This is a real bug
+Investigated 2026-08-21/22, branch `request_logging`. This was a real bug
 in upstream vLLM 0.27.1's `mamba_cache_mode=align` implementation, not a
 config problem in this repo. A fix was written
 (`patches/mamba-align-stale-state-queue.patch`) that correctly eliminates
-the leak itself (verified, see "The fix" below), but every time it's been
+the leak itself (verified, see "The fix" below), but every time it was
 tried under fuller production conditions (real concurrency, offloading
-enabled) it has broken something else -- first an apparent hang (turned
-out to be PSU-related, see below, not the fix), then a confirmed,
-precisely-diagnosed-but-still-unresolved KV-offloading interaction (see
-"The fix breaks KV offloading at 2048" below). It is **not currently safe
-to apply**.
+enabled) it broke something else -- first an apparent hang (turned out to
+be PSU-related, see below, not the fix), then a genuine KV-offloading
+regression that turned out to be a second, separate, real upstream bug in
+the connector (see "The fix breaks KV offloading at 2048" below) --
+exposed by the leak fix (which made Mamba/GDN groups' offload paths
+actually get exercised for the first time), but not caused by it. Both
+are now fixed.
 
 [← back to the main README](../README.md)
 
@@ -410,7 +413,7 @@ see the update above; kept here for the historical record):**
    and instead route through whatever mechanism the scheduler-level fix
    uses.
 
-## The fix breaks KV offloading at 2048 -- REVERTED, root cause narrowed but not fixed
+## The fix breaks KV offloading at 2048 -- root cause found and fixed
 
 Found 2026-08-22, ~11:00 UTC, extensively re-investigated same day through
 ~13:40 UTC. After the hang was provisionally cleared (previous section),
@@ -425,14 +428,19 @@ pre-reboot report ("we are now _re-processing_ prompts _after_ the reply
 is finished") looked like an infinite loop: a full reprocess of an 88K
 prompt just looks like a stall if you're not watching the token counter.
 
-**Bottom line up front:** this is real, 100% reproducible, and now
-precisely characterized -- but not yet fixed. It is specifically tied to
-`--max-num-batched-tokens`: broken at 2048 (what we want), works at 1024
-(not an acceptable fix -- see the repo's own throughput numbers for why
-1024 was the thing we were trying to get away from). A large amount of
-work went into ruling out simpler explanations one at a time; each is
-recorded below because re-deriving them cost real time and they are all
-non-obvious.
+**Bottom line up front:** this was real, 100% reproducible, and is now
+**fixed** (`patches/offload-eagle-misclassification-mamba.patch`) -- a
+genuine, separate bug in vLLM's own offloading connector, not in the leak
+fix. It was misleadingly tied to `--max-num-batched-tokens` (broken at
+2048, working at 1024) during the investigation -- that correlation was
+real but was a red herring for the actual mechanism (see "What it is:
+tied to chunk size" below for how that led toward, but not quite to, the
+real cause; the actual root cause has nothing to do with chunk size or
+timing at all, see "Root cause found" further down). A large amount of
+work went into ruling out simpler explanations one at a time first; each
+is recorded below because re-deriving them cost real time and they are
+all non-obvious, even though the final answer turned out to be none of
+them.
 
 ### Fast, reliable repro
 
@@ -593,64 +601,121 @@ further than this once the batch-size experiment above made the
 higher-level mechanism (step-frequency-driven polling vs. token-count-driven
 churn) clear enough to stop guessing at the last mile.
 
-### What was NOT the cause (revised from an earlier, wrong hypothesis)
+### What was NOT the cause (revised from earlier, wrong hypotheses)
 
-An earlier version of this section hypothesized a same-scheduling-step
-race between our fix's `block_pool.free_blocks()` call (in
-`allocate_slots()`, which runs before `build_connector_meta()` within
-`Scheduler.schedule()`) and the connector's store-job builder seeing a
-null block. Directly instrumented and **disproven**: zero
-`block_id == 0` skips ever observed in `_build_store_jobs()`, at any
-margin, in any run. That whole theory is wrong; left here so it isn't
-re-derived and re-disproven again.
+Two earlier hypotheses in this section, kept here so they aren't
+re-derived and re-disproven again:
+
+- A same-scheduling-step race between our fix's `block_pool.free_blocks()`
+  call (in `allocate_slots()`, which runs before `build_connector_meta()`
+  within `Scheduler.schedule()`) and the connector's store-job builder
+  seeing a null block. Directly instrumented and **disproven**: zero
+  `block_id == 0` skips ever observed in `_build_store_jobs()`, at any
+  margin, in any run.
+- The step-frequency/async-promotion-polling theory in the section just
+  above ("What it is: tied to chunk size"). This correctly identified
+  that batch size correlated with the bug and correctly ruled out every
+  freeing-condition theory, but the *mechanism* it proposed (promotions
+  not settling in time at low step-frequency) was never actually
+  confirmed down to a stack trace or a stalled job -- and turned out not
+  to be it. See below for what was actually happening, which also
+  explains *why* 1024 happened to avoid it (smaller chunks happen to keep
+  a stale intermediate query-window state from ever narrowing into the
+  failure condition as reliably -- not because anything was settling
+  faster).
+
+### Root cause found: Mamba/GDN groups misclassified as EAGLE/MTP draft groups
+
+Found by instrumenting `_lookup()`'s per-group result with `group_idx`,
+`num_hit_chunks`, and (crucially, the piece the earlier investigation
+hadn't checked) `is_eagle_group`/`is_eagle_unverified`:
+
+```
+group_idx=3 (attention) num_hit_chunks=105 is_eagle_group=True is_eagle_unverified=True
+group_idx=0 (mamba)     num_hit_chunks=0   is_eagle_group=True is_eagle_unverified=True
+```
+
+**`is_eagle_group=True` for the Mamba/GDN groups was the bug.**
+`SchedulerOffloadConfig.from_spec()` (scheduler.py, ~line 208) has this
+fallback:
+
+```python
+eagle_groups = {idx for idx, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group}
+use_eagle = vllm_config.speculative_config is not None and vllm_config.speculative_config.use_eagle()
+if use_eagle and not eagle_groups:
+    eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))  # <- marks EVERY group
+```
+
+This model's KV-cache groups aren't explicitly tagged `is_eagle_group`
+(correctly -- none of them, including the 3 Mamba/GDN groups, are the MTP
+draft head's own state; this repo's MTP draft module has no mamba
+layers). Since `speculative_config.use_eagle()` is True for MTP and
+`eagle_groups` came back empty, the fallback assumed *every* group might
+hold volatile draft-model state and marked all 4 groups -- including the
+3 Mamba/GDN ones -- as eagle groups.
+
+Being an eagle group adds +1 to the required window in
+`_sliding_window_lookup()` (`required_window = sliding_window_size_in_chunks
++ 1` when `is_eagle_unverified`, to query one extra provisional chunk and
+pop it once verified -- a real mechanism, needed for genuine draft-model
+groups). For Mamba, this turned a "need 1 hit" lookup into a "need 2
+*consecutive* hits" lookup. Per-key instrumentation showed the actual
+data alternates hit/miss/hit/miss with no two consecutive hits ever
+(itself a downstream effect of the same eagle-only "extra provisional
+chunk" querying, applied somewhere it structurally doesn't have a partner
+chunk to pair with) -- so this lookup was **guaranteed to fail every
+single time**, at any batch size, independent of any timing or race
+condition. Full-attention's group is also marked (wrongly) as eagle, but
+`_maximal_prefix_lookup()` (used for non-sliding-window groups) doesn't
+have a consecutive-run requirement, so the misclassification is silent
+there -- which is exactly why only Mamba's lookup ever showed a problem.
+
+Batch size was a real but incidental correlate: it changed how the
+`_lookup()` convergence loop's query-window narrowing happened to line up
+against the alternating hit/miss pattern across different runs, which is
+why 1024 looked reliably safe in testing -- not because it fixed anything
+about the actual defect.
+
+**The fix** (`patches/offload-eagle-misclassification-mamba.patch`):
+exclude `MambaSpec` groups from the eagle-fallback classification --
+they're never a legitimate "draft model's volatile trailing chunk"
+scenario the way a shared/ambiguous attention KV group can be. Includes a
+second, smaller, defense-in-depth fix in the same function:
+`_sliding_window_lookup()` previously discarded an already-confirmed HIT
+run if *any* newer position scanned first came back `RETRY`, even though
+that older run was already safe to use (the mirror image of the eagle
+bug -- an older valid hit shouldn't be held hostage by a newer, unrelated
+position's settling status). This didn't turn out to be the primary
+cause here (the eagle miscount alone was sufficient to explain 100% of
+failures), but it's a real, independently-reasoned correctness
+improvement, kept in the same patch. See the patch file's own header for
+the full writeup.
+
+**Verified** (2026-08-22, both patches applied, default
+`--max-num-batched-tokens 2048`): `test_offload_regression.sh` passes
+reliably across multiple runs (`hit 84864 offloaded tokens`-style lines,
+turn 2 in 6-8s). 2x genuinely concurrent ~88K-token prompts complete with
+zero preemptions. A 3x concurrent ~120K-token stress test (360K tokens of
+combined demand against a ~172K-token pool, over 2x oversubscribed)
+completes with **zero preemptions and zero discarded/never-offloaded KV
+cache**, peak GPU-KV usage only 72.4%. The leak fix's own numbers are
+unaffected (peak usage ~55%, zero preemptions on the original solo-88K-
+prompt repro).
 
 ### Action taken
 
-Reverted to the original scalar `last_state_block_idx` code (confirmed
-via `grep -c _stale_state_block_idxs` returning 0). `single-user/
-start_qwen.sh` is back at `--max-num-batched-tokens 2048` (it was
-temporarily flipped to 1024 for the diagnostic experiment above and
-restored via `git checkout`). Debug instrumentation added during this
-investigation (temporary `print()` calls in `single_type_kv_cache_manager.py`,
-`distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py`, and
-`v1/kv_offload/tiering/manager.py`) was all removed -- those three files
-should currently match pristine upstream 0.27.1 plus the *other*,
-unrelated patches in `patches/`.
-
-### Next steps for whoever picks this up
-
-1. Use `test_offload_regression.sh` for fast iteration (~4 min per
-   attempt). The batch-size table above is the fastest way to confirm
-   you're still looking at the same bug (broken at 2048, working at
-   1024, with the *unthrottled* fix applied both times).
-2. The remaining gap is the exact stall: why the async promotion
-   pipeline's step-gated polling (`_maybe_process_finished_jobs`,
-   `TieringOffloadingManager`) falls behind specifically at 2048. This
-   needs re-instrumenting `_sliding_window_lookup()`
-   (scheduler.py, tag with `group_idx` and `req_id`) and correlating
-   against `_process_finished_jobs()` / `_flush_pending_promotions()`
-   timing (`v1/kv_offload/tiering/manager.py`) across both batch sizes,
-   watching specifically for whether promotions get *submitted* less
-   often at 2048 (fewer steps -> fewer `on_schedule_end()` calls -> fewer
-   `_flush_pending_promotions()` calls) or *completed* less often
-   (thread-pool contention, though the fs tier's 16+16 threads make raw
-   thread starvation unlikely) per unit wall-clock time.
-3. If confirmed as "the connector's per-step polling cadence can't keep
-   up at low step-frequency," candidate fixes are all at the *connector*
-   level, not in `single_type_kv_cache_manager.py`: e.g. polling more
-   than once per step when steps are large, or making
-   `_sliding_window_lookup()`'s zero-tolerance-for-RETRY behavior more
-   forgiving specifically when a later (older) index already resolved to
-   a clean HIT. Both are deep, unfamiliar, performance-sensitive vLLM
-   internals (`v1/kv_offload/tiering/`) -- change them carefully and
-   re-verify with `test_offload_regression.sh` at 2048 specifically, not
-   just the leak-fix's own peak-usage numbers.
-4. Alternatively: if this turns out to be a genuine upstream vLLM
-   limitation (align-mode Mamba's zero-tolerance sliding-window lookup
-   combined with step-driven churn), it may be worth reporting upstream
-   rather than patching around it here -- it would affect any align-mode
-   Mamba + KV-offloading deployment at large batch sizes, not just this
-   repo.
+Both patches applied and verified:
+`patches/mamba-align-stale-state-queue.patch` (the leak fix) and
+`patches/offload-eagle-misclassification-mamba.patch` (the offloading
+fix). `single-user/start_qwen.sh` stays at `--max-num-batched-tokens
+2048` (it was temporarily flipped to 1024 for a diagnostic experiment
+during the investigation and restored via `git checkout`). All debug
+instrumentation added during this investigation (temporary `print()`
+calls across `single_type_kv_cache_manager.py`, `distributed/kv_transfer/
+kv_connector/v1/offloading/scheduler.py`, and `v1/kv_offload/tiering/
+manager.py`) was removed before finalizing the patches -- both patch
+files are minimal, confirmed via `patch -p1 -R --dry-run` matching the
+live tree exactly.
 
 ### Separate TODO surfaced by this investigation: no disk cap on the fs offload tier
 
@@ -671,7 +736,7 @@ eviction for the fs tier, mirroring the primary tier's), or in the
 meantime an external prune script/cron/systemd-timer against `root_dir`
 as a practical mitigation.
 
-## Reproducing the hang (historical -- only relevant if a hang recurs; the fix is reverted as of 2026-08-22 ~13:40 UTC, see the offloading section above)
+## Reproducing the hang (historical -- only relevant if a hang recurs; both fixes are applied as of 2026-08-22 ~15:30 UTC, see the offloading section above)
 
 ```
 bash micke-start.sh
@@ -721,10 +786,11 @@ Then, against a fresh server:
 echo "..." | venv/bin/python local_chat_test.py -p 4000
 ```
 
-This is what the fix (when it worked) resolved. The patch is currently
-reverted, so this config will currently show the original leak/
-self-preemption behavior, not the hang -- the hang needs the offloading
-connector + real concurrency, per the section above.
+This is what `patches/mamba-align-stale-state-queue.patch` fixes. Both
+that patch and `patches/offload-eagle-misclassification-mamba.patch` are
+applied in the current venv -- reverse-apply
+`mamba-align-stale-state-queue.patch` first if you want to see the
+original leak/self-preemption behavior again.
 
 Diagnostic patches (apply on top of the base patch set, quiet by default
 -- gated on free blocks < 15% of pool, so normal short-prompt traffic

@@ -265,7 +265,7 @@ perplexity / GSM8K rows.
 | [docs/quality.md](docs/quality.md) | IFBench, perplexity and GSM8K per configuration. |
 | [docs/docker.md](docs/docker.md) | The container image, and an independent WSL2 reproduction. |
 | [docs/long-context.md](docs/long-context.md) | 262k context with the KVarN 4/2-bit KV cache, and what vLLM's own per-token-head KV modes are worth here. |
-| [docs/mamba-align-prefill-leak.md](docs/mamba-align-prefill-leak.md) | Root cause for large-prompt self-preemption in `mamba-cache-mode align`'s block freeing. **Fix reverted 2026-08-22** — correctly eliminates the leak but breaks KV offloading specifically at `--max-num-batched-tokens 2048` (works fine at 1024, which isn't an acceptable substitute); root cause narrowed to a step-frequency-vs-async-promotion-cadence mismatch, not yet fixed. |
+| [docs/mamba-align-prefill-leak.md](docs/mamba-align-prefill-leak.md) | Root cause for large-prompt self-preemption in `mamba-cache-mode align`'s block freeing, plus a second upstream bug it exposed (KV-offloading connector misclassifying Mamba/GDN groups as EAGLE/MTP draft groups). **Both fixed 2026-08-22** and verified under concurrent load at the default `--max-num-batched-tokens 2048`. |
 | [batch/](batch/) · [single-user/](single-user/) | The two serving modes: full benchmark tables, every env knob, systemd units. |
 | [drafter/](drafter/) | How the draft vocabulary, the int4 drafters and the DFlash2 requantization were built — including what did not work. |
 | [kvarn/](kvarn/) | The KVarN 4/2-bit KV cache port. |

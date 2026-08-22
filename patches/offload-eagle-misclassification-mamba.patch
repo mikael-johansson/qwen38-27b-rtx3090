@@ -1,0 +1,156 @@
+Fix: KV-offloading connector misclassifies Mamba/GDN groups as EAGLE/MTP
+draft-model groups, permanently breaking their external-cache lookup.
+
+Full investigation: docs/mamba-align-prefill-leak.md ("The fix breaks KV
+offloading" -> "Root cause found and fixed"). Fast, reliable repro:
+bash test_offload_regression.sh (~4 min, works/fails deterministically).
+
+Root cause (two compounding issues in
+distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py):
+
+1. SchedulerOffloadConfig.from_spec() has a fallback: if speculative
+   decoding is EAGLE-style (MTP counts, via speculative_config.use_eagle())
+   and no KV-cache group is explicitly tagged is_eagle_group, it assumes
+   *every* group might hold volatile draft-model state and marks them all
+   as eagle groups. This model's Mamba/GDN groups aren't tagged
+   is_eagle_group (correctly -- they're the main model's own recurrent
+   state, not the MTP draft head's; this repo's MTP draft module has no
+   mamba layers), so the fallback wrongly swept them in too.
+
+2. Being marked an eagle group adds +1 to the required window size in
+   _sliding_window_lookup() (query one extra, provisional chunk, then pop
+   it once verified). For Mamba/GDN groups this bumps the lookup from
+   needing 1 hit to needing 2 *consecutive* hits. Confirmed via direct
+   instrumentation that the actual data structurally never has 2
+   consecutive hits available (an artifact of the same eagle-only "extra
+   provisional chunk" querying being applied where it doesn't apply) --
+   so the lookup was guaranteed to fail every time, at any batch size,
+   regardless of any timing/race condition. This is what
+   docs/mamba-align-prefill-leak.md had otherwise fully but incorrectly
+   attributed to a free/store timing race (that hypothesis is disproven
+   in the doc, kept for the record) after the mamba-align leak fix
+   (patches/mamba-align-stale-state-queue.patch) started exercising
+   Mamba/GDN offload paths that the original, leakier code rarely
+   reached.
+
+A second, smaller, defense-in-depth fix in the same function:
+_sliding_window_lookup() scans newest->oldest and previously discarded an
+already-confirmed HIT run if *any* newer position it scanned first
+returned RETRY (uncertain/still-settling) -- even though that older run
+was already safe to use. This is the mirror image of issue 2 above (an
+older, valid hit shouldn't be held hostage by whether a newer, unrelated
+position has settled yet) and was independently confirmed to matter:
+_maximal_prefix_lookup() (used for full-attention groups, scans
+oldest->newest) doesn't have this problem since it naturally reaches
+"freshest chunks still unsettled" only at the very tail of its range,
+where it can just stop cleanly instead of scanning through them first.
+Only a HIT_PENDING *within* the actual satisfying run still defers
+correctly, since that data genuinely isn't readable yet.
+
+Verified (2026-08-22) with patches/mamba-align-stale-state-queue.patch
+also applied, at the default --max-num-batched-tokens 2048 (previously
+always failed here -- see the doc's batch-size table): test_offload_
+regression.sh passes reliably (multiple runs), 2x concurrent ~88K-token
+prompts complete with zero preemptions, and a 3x concurrent ~120K-token
+stress test (360K tokens of combined demand against a ~172K-token pool)
+completes with zero preemptions, zero discarded/never-offloaded KV cache,
+and peak GPU-KV usage of only 72.4%.
+
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -216,7 +216,31 @@
+             and vllm_config.speculative_config.use_eagle()
+         )
+         if use_eagle and not eagle_groups:
+-            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
++            # Fallback for architectures where the draft model's KV cache
++            # groups aren't explicitly tagged is_eagle_group: assume every
++            # group might hold volatile draft-model state and require an
++            # extra trailing chunk before trusting a sliding-window hit.
++            # This is wrong for Mamba/GDN recurrent-state groups: they are
++            # the *main* model's own state (this repo's MTP draft head has
++            # no mamba layers -- see single_type_kv_cache_manager.py's own
++            # allocate_new_blocks() comment on this), never a
++            # draft-model's, so there's no volatile trailing chunk to guard
++            # against. Applying the +1-chunk eagle window there instead
++            # permanently breaks their offload lookup: align-mode Mamba
++            # groups use a 1-chunk sliding window (get_sliding_window_size_
++            # in_chunks() above), and the eagle fallback bumps that to a
++            # 2-consecutive-chunk requirement that the data can structurally
++            # never satisfy (confirmed via test_offload_regression.sh: full
++            # miss, every time, at any batch size -- see
++            # docs/mamba-align-prefill-leak.md). Excluding Mamba groups
++            # here fixes it.
++            eagle_groups = {
++                idx
++                for idx in range(len(kv_cache_config.kv_cache_groups))
++                if not isinstance(
++                    kv_cache_config.kv_cache_groups[idx].kv_cache_spec, MambaSpec
++                )
++            }
+ 
+         if eagle_groups:
+             logger.info(
+@@ -584,30 +608,53 @@
+     ) -> int | None:
+         """Return the end index (in `keys`) of the last run of
+         `sliding_window_size` consecutive hits, scanning from the end.
+-        Returns 0 on miss, None if the backend deferred a lookup."""
+-        defer_lookup = False
++        Returns 0 on miss, None if the backend deferred a lookup.
++
++        A RETRY on a position newer than an otherwise-satisfying run does
++        NOT block returning that (slightly older) run: reusing
++        already-confirmed data is strictly cheaper than a full recompute,
++        and whether it's safe to reuse doesn't depend on whether some
++        newer, still-unsettled position resolves too. Only a HIT_PENDING
++        *within* the satisfying run still defers, since that specific
++        data genuinely isn't readable yet. Without this, a scan direction
++        asymmetry vs. `_maximal_prefix_lookup` (which scans old->new and
++        so only reaches "freshest chunks still unsettled" at the very
++        tail of its range, where it can just stop cleanly) meant this
++        function -- used for Mamba/GDN groups via
++        `sliding_window_size_in_chunks=1` -- reliably discarded a valid,
++        already-confirmed hit under real load, because it scans new->old
++        and hits the freshest (most likely still-settling) positions
++        first. See docs/mamba-align-prefill-leak.md.
++        """
++        any_uncertain = False
+         consecutive_hits = 0
++        run_has_pending = False
+         for idx in range(len(keys) - 1, -1, -1):
+             match self.manager.lookup(keys[idx], req_context):
+                 case LookupResult.HIT:
+                     consecutive_hits += 1
+                 case LookupResult.HIT_PENDING:
+                     # Block is in cache, just not readable yet — counts
+-                    # as hit for the consecutive streak. Don't break:
++                    # as hit for the consecutive streak, but a run
++                    # containing it can't be returned early. Don't break:
+                     # keep scanning to let manager kick off async lookups.
+-                    defer_lookup = True
++                    any_uncertain = True
++                    run_has_pending = True
+                     consecutive_hits += 1
+                 case LookupResult.RETRY:
+-                    # Block location uncertain — does not count as hit.
++                    # Block location uncertain for THIS (newer) position.
+                     # Don't break: keep scanning to let manager kick off
+-                    # async lookups.
+-                    defer_lookup = True
++                    # async lookups -- but this must not poison an older,
++                    # already-confirmed run found further back.
++                    any_uncertain = True
+                     consecutive_hits = 0
++                    run_has_pending = False
+                 case LookupResult.MISS:
+                     consecutive_hits = 0
++                    run_has_pending = False
+             if consecutive_hits == sliding_window_size:
+-                return idx + sliding_window_size if not defer_lookup else None
+-        return consecutive_hits if not defer_lookup else None
++                return None if run_has_pending else idx + sliding_window_size
++        return consecutive_hits if not any_uncertain else None
+ 
+     def _touch(self, req_status: RequestOffloadState):
+         for group_config, group_state in zip(

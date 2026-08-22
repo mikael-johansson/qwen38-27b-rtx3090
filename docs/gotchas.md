@@ -35,19 +35,23 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
    depending on what the noise turns into. Use real prompts
    (`--dataset-name custom`).
 7. **`--max-num-batched-tokens 8192` still inflates the profiled
-   activation peak** (shrinks the cache pool, caps concurrency), and
-   **1024 still beats 2048 for now — the leak fix is reverted again.**
-   `--mamba-cache-mode align` has a real vLLM leak in the Mamba/GDN
-   state-freeing check at larger chunk sizes (a single, unopposed large
-   prompt can self-preempt against nothing but its own leak). A fix
-   (`patches/mamba-align-stale-state-queue.patch`) eliminates the leak
-   correctly but has a precisely-characterized, still-unresolved
-   interaction with KV offloading that only shows up at
-   `--max-num-batched-tokens 2048` — reverted 2026-08-22. See
-   [docs/mamba-align-prefill-leak.md](mamba-align-prefill-leak.md)
-   before touching that patch. 8192 itself still isn't safe without
-   raising `--gpu-memory-utilization` headroom first either way
-   (OOM-crashes the engine, unrelated to the mamba leak).
+   activation peak** (shrinks the cache pool, caps concurrency), but
+   **2048 is fine — both the mamba-align leak fix and its KV-offloading
+   interaction are fixed as of 2026-08-22.** `--mamba-cache-mode align`
+   had a real vLLM leak in the Mamba/GDN state-freeing check at larger
+   chunk sizes (a single, unopposed large prompt could self-preempt
+   against nothing but its own leak); fixing it exposed a second, unrelated
+   upstream bug where the KV-offloading connector misclassified Mamba/GDN
+   groups as EAGLE/MTP draft groups, permanently breaking their external
+   cache lookup. Both are applied
+   (`patches/mamba-align-stale-state-queue.patch`,
+   `patches/offload-eagle-misclassification-mamba.patch`) and verified
+   under real concurrent load (2x~88K and 3x~120K prompts, zero
+   preemptions, zero discarded KV cache) — see
+   [docs/mamba-align-prefill-leak.md](mamba-align-prefill-leak.md) for
+   the full story. 8192 itself still isn't safe without raising
+   `--gpu-memory-utilization` headroom first either way (OOM-crashes the
+   engine, unrelated to the mamba leak).
 8. **Benchmark twice.** The first run after any restart includes JIT warmup
    and reads 30-50% low.
 9. **`--language-model-only` drops the vision tower cleanly** (no weights
