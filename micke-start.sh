@@ -1,4 +1,11 @@
 #!/bin/sh
+# Cap the fs KV-offload cache before starting -- vLLM's FileSystemTierManager
+# has no size limit or eviction of its own (see prune_kv_offload_cache.sh's
+# header and docs/mamba-align-prefill-leak.md's "no disk cap" TODO). This
+# only catches growth between server restarts; for a long-running session,
+# add a cron entry too, e.g.:
+#   */30 * * * * bash $(pwd)/prune_kv_offload_cache.sh
+bash "$(dirname "$0")/prune_kv_offload_cache.sh" /d/nvme_cache/vllm_kv || true
 ITERATION_LOG=1 \
 REQUEST_LOG_DIR=$(pwd)/requests \
 VLLM_LOG_STATS_INTERVAL=1 \

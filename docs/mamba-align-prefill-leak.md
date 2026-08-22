@@ -717,24 +717,38 @@ manager.py`) was removed before finalizing the patches -- both patch
 files are minimal, confirmed via `patch -p1 -R --dry-run` matching the
 live tree exactly.
 
-### Separate TODO surfaced by this investigation: no disk cap on the fs offload tier
+### Separate issue surfaced by this investigation: no disk cap on the fs offload tier -- mitigated
 
 `v1/kv_offload/tiering/fs/manager.py`'s `FileSystemTierManager.__init__`
 takes `root_dir`, `n_read_threads`, `n_write_threads`,
 `enable_kv_events`, `locality` -- **no size limit, no eviction policy**,
-unlike the primary CPU tier (`cpu_bytes_to_use`, LRU/ARC eviction). It
-just writes files to `root_dir` forever. This investigation's repeated
-88K-token test runs filled `/d/nvme_cache` (234G) to 100% over the
-course of a few hours, which is exactly what would eventually happen in
-normal long-running production use too, just slower. No config flag
-exists to cap it today (confirmed by reading the full `__init__`
-signature and its `SecondaryTierFactory` construction path -- any extra
-key in `kv_connector_extra_config.secondary_tiers[...]` besides `type`
-gets passed straight through as a kwarg, and there's nothing to catch).
-Worth a follow-up: either an upstream vLLM feature (real size-based LRU
-eviction for the fs tier, mirroring the primary tier's), or in the
-meantime an external prune script/cron/systemd-timer against `root_dir`
-as a practical mitigation.
+unlike the primary CPU tier (`cpu_bytes_to_use`, LRU/ARC eviction). Its
+`FileMapper` (`v1/kv_offload/file_mapper.py`) is a pure content-hash ->
+path mapper with no size tracking either. It just writes files to
+`root_dir` forever. This investigation's repeated 88K-token test runs
+filled `/d/nvme_cache` (234G) to 100% over the course of a few hours,
+which is exactly what would eventually happen in normal long-running
+production use too, just slower. No config flag exists to cap it
+(confirmed by reading the full `__init__` signature of both classes and
+the `SecondaryTierFactory` construction path -- any extra key in
+`kv_connector_extra_config.secondary_tiers[...]` besides `type` is
+passed straight through as a kwarg, and there's nothing there to catch a
+size/quota option). This is an upstream vLLM gap, not something to patch
+around in vLLM's own code here.
+
+**Mitigated 2026-08-22** with `prune_kv_offload_cache.sh` (repo root): an
+external LRU-by-atime pruner (confirmed `relatime` is active on
+`/d/nvme_cache`, so atime is a real, if coarse, recency signal) that caps
+the tier at 200G, pruning down to 180G once triggered. Only deletes
+`*.bin` block files, never the tiny per-run `config.json`. Safe to run
+against a live server -- deleting a block mid-lookup just produces one
+ordinary MISS, which the connector already handles gracefully (confirmed
+throughout this whole investigation, which is full of exactly this kind
+of miss happening for unrelated reasons without incident). Wired into
+`micke-start.sh` as a pre-flight check (catches growth between server
+restarts); for a long-running session, add a cron entry too (exact line
+in `micke-start.sh`'s own comment) since the pre-flight check alone
+doesn't catch growth *during* a session that isn't restarted for days.
 
 ## Reproducing the hang (historical -- only relevant if a hang recurs; both fixes are applied as of 2026-08-22 ~15:30 UTC, see the offloading section above)
 
