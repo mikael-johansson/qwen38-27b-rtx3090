@@ -1,14 +1,51 @@
 #!/bin/sh
 ITERATION_LOG=1 \
 REQUEST_LOG_DIR=$(pwd)/requests \
-VLLM_LOG_STATS_INTERVAL=1 \
+VLLM_LOG_STATS_INTERVAL=10 \
 VLLM_CACHE_METRICS_WINDOW=3 \
 PREFIX_CACHE=1 \
 CTX=long \
 MAX_LEN=140000 \
+PYTHONHASHSEED=0 \
 VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file-debug.json \
-EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv","max_disk_gib":200}]}} --enable-cumem-allocator' \
+EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --long-prefill-token-threshold 512 --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv","max_disk_gib":200}]}} --enable-cumem-allocator' \
 bash single-user/start_qwen.sh
+# PYTHONHASHSEED=0 -- fixes the KV-block hash chain's seed (NONE_HASH in
+# vllm/v1/core/kv_cache_utils.py) to a constant instead of os.urandom(32),
+# which vLLM otherwise regenerates fresh on every process start. Without
+# this, every block hash for the whole session comes out different across
+# restarts even for byte-identical prompts, so the NVMe fs-offload tier's
+# on-disk cache (patches/fs-tier-disk-cap.patch) is unreachable after a
+# restart -- the files are still there, just under hash-paths this new
+# process can never re-derive. With a fixed seed, a restarted server can
+# actually find and reuse its own prior session's offloaded blocks. See
+# 2026-08-22 conversation. (0 is an arbitrary fixed constant, not
+# security-sensitive here -- single-user, trusted deployment.)
+#
+# --long-prefill-token-threshold 512 -- caps how many tokens of a single
+# request's prefill get scheduled per step, even once that request is
+# already admitted into the running batch. Without this (default 0 =
+# unlimited), an admitted long prompt is entitled to the entire
+# --max-num-batched-tokens (2048) budget every single step until its own
+# prefill finishes, starving other running/waiting requests of that step's
+# budget the whole time -- confirmed by reading scheduler.py's schedule():
+# the running-phase loop runs before the waiting-phase loop and hands out
+# token_budget FCFS with no per-request cap unless this is set. At 512,
+# a big prefill now yields the rest of the budget back every step, letting
+# other conversations' decode and other prefills' chunks interleave instead
+# of one long prompt monopolizing the server until it's done. See
+# 2026-08-22 conversation.
+#
+# Note: vLLM also has --scheduling-policy priority (default: fcfs), which
+# would let requests carry an explicit priority (the OpenAI-compatible API
+# already accepts a `priority` field per request, currently ignored under
+# fcfs) -- lower-priority *admission* order and, if KV blocks are scarce,
+# actual preemption of the lowest-priority running request. Not enabling
+# this now (fcfs is fine given long-prefill-token-threshold above already
+# addresses the main starvation complaint) -- worth revisiting if we want
+# specific requests (e.g. short agentic deltas) to jump the waiting queue
+# ahead of a big prefill rather than just interleaving with it. Note it
+# does NOT bypass the --max-num-seqs=8 admission-slot cap either way.
 # max_disk_gib:200 on the fs secondary tier -- patches/fs-tier-disk-cap.patch
 # adds this parameter to vLLM's FileSystemTierManager (no upstream equivalent
 # exists in 0.27.1, unlike the primary CPU tier's cpu_bytes_to_use). A
