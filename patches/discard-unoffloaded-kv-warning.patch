@@ -1,0 +1,104 @@
+Loud, always-on (not DEBUG-gated) warning logged whenever a request's KV
+cache is being freed and some or all of it was never offloaded -- i.e.
+it's gone for good and continuing that conversation will need a full
+recompute rather than a cache lookup. Fires in two cases:
+
+  - No KV-offloading connector configured at all: every freed block is
+    unconditionally gone, so this fires for any request with computed
+    tokens.
+  - An offloading connector (e.g. OffloadingConnector) is configured but
+    some tail of the request's content was never queued for store, past
+    a one-chunk margin (a normal finish queues its trailing chunk's
+    store job on the *next* schedule step -- request_finished()'s own
+    docstring -- so a small, safe lag right at completion is expected
+    and shouldn't be noise on every routine request).
+
+Verified quiet through normal offloaded completions (only firing on the
+genuine sub-chunk tail lag, not spuriously on every request), and
+correctly loud with no connector configured. See
+docs/mamba-align-prefill-leak.md for the unrelated-but-nearby investigation
+this came out of.
+
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -2396,6 +2396,7 @@
+                 request.last_sched_seq <= self.processed_step_seq
+             )
+         )
++        self._warn_if_discarding_unoffloaded_kv(request)
+         logger.debug(
+             "request-logging preemption-debug: _free_request_blocks(%s) "
+             "status=%s path=%s force_defer=%s defer_block_free=%s "
+@@ -2416,6 +2417,72 @@
+         if blocks:
+             self.deferred_frees.append((self.sched_step_seq, blocks))
+
++    def _warn_if_discarding_unoffloaded_kv(self, request: Request) -> None:
++        """Loudly flag KV cache that is about to disappear for good.
++
++        request-logging: with no connector configured, every freed block's
++        KV is gone permanently -- the only way back is a full recompute.
++        With an offloading connector configured, some of a request's
++        content can still be un-offloaded at free time (aborted mid-chunk,
++        or the connector's own store pipeline hasn't caught up yet -- see
++        docs/mamba-align-prefill-leak.md for a related but distinct lag).
++        Either way this is worth a loud, always-on log line, not a
++        DEBUG-gated one: it's the difference between "resume costs a cache
++        lookup" and "resume costs a full recompute of this session."
++        """
++        if request.num_computed_tokens <= 0:
++            return
++        if self.connector is None:
++            logger.warning(
++                "\nDiscarding KV cache for session %s!!! %d tokens gone for "
++                "good, no offloading connector configured -- continuing "
++                "this conversation will recompute them from scratch.\n",
++                request.request_id,
++                request.num_computed_tokens,
++            )
++            return
++        connector_scheduler = getattr(self.connector, "connector_scheduler", None)
++        req_status_map = getattr(connector_scheduler, "_req_status", None)
++        if req_status_map is None:
++            # Not an offloading-style connector (e.g. P/D disaggregation) --
++            # no generic notion of "offloaded so far" to check against.
++            return
++        req_status = req_status_map.get(request.request_id)
++        if req_status is None:
++            offloaded_tokens = 0
++            margin = 0
++        else:
++            offloaded_tokens = min(
++                (
++                    group_state.next_stored_chunk_idx * group_config.tokens_per_chunk
++                    for group_config, group_state in zip(
++                        req_status.config.kv_group_configs, req_status.group_states
++                    )
++                ),
++                default=0,
++            )
++            # A normal finish queues the trailing chunk's store job on the
++            # *next* schedule step (request_finished()'s docstring) -- by
++            # the time we get here that chunk may be committed but not yet
++            # collected into next_stored_chunk_idx, even though it's safe
++            # (a reuse of its blocks would force a flush first, see
++            # _block_id_to_pending_jobs). One chunk of slack avoids
++            # warning on every routine completion for that reason alone.
++            margin = max(
++                (gc.tokens_per_chunk for gc in req_status.config.kv_group_configs),
++                default=0,
++            )
++        gap = request.num_computed_tokens - offloaded_tokens
++        if gap > margin:
++            logger.warning(
++                "\nDiscarding KV cache for session %s!!! %d of %d computed "
++                "tokens were never offloaded and will need a full recompute "
++                "to continue this conversation.\n",
++                request.request_id,
++                gap,
++                request.num_computed_tokens,
++            )
++
+     def _free_cow_retained_blocks(
+         self, blocks: list[KVCacheBlock], fence_seq: int
+     ) -> None:

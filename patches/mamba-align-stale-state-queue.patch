@@ -1,0 +1,165 @@
+The real fix for the mamba-align prefill self-preemption bug documented
+in docs/mamba-align-prefill-leak.md. Replaces the earlier debug-only
+patch of the same file (preemption-mamba-align-freeing-debug-logging.patch,
+now removed -- its logging proved the mechanism and is no longer needed).
+
+Root cause: `mamba_cache_mode="align"` tracked exactly one "block index
+superseded by a newer running-state block" per request, in a plain
+scalar (`last_state_block_idx: dict[str, int]`). Every step that
+allocates a new running-state block OVERWRITES that scalar with the
+new stale position -- unconditionally, whether or not the *previous*
+stale position had actually been freed yet. During a continuous
+chunked-prefill run, the freeing check (`last_state_block_idx <
+processed-tokens-derived threshold`) stays in permanent lockstep --
+equal, never strictly less -- for the entire prefill (proven via direct
+instrumentation: 0/107 successful frees across 3 Mamba/GDN KV-cache
+groups, at two different chunk sizes). So the scalar gets overwritten,
+over and over, before its check ever passes, silently dropping every
+stale block except the very latest -- and none of them ever get freed
+during prefill. Confirmed with a shared-pool full-attention manager, the
+model's 3 separate Mamba/GDN groups leak ~1 never-freed block per group
+per scheduling step, which is what exhausts the KV cache pool and
+self-preempts a single, uncontested large-prompt request against nothing
+but its own bookkeeping.
+
+The fix: turn the scalar into a per-request FIFO queue
+(`_stale_state_block_idxs: dict[str, list[int]]`). Nothing about *when*
+a position becomes safe to free changes -- same threshold, same
+comparison, same GPU-synchronization safety margin (deliberately not
+touched: processed_computed_tokens excludes tokens whose GPU-side work
+isn't confirmed complete yet, and loosening that comparison risked a
+real correctness bug, not just a memory leak). What changes is that
+every pending entry gets evaluated, not only the newest. Since indices
+are strictly increasing and the newest one sits exactly at the
+threshold every step (proven above), every *older* pending entry is
+therefore already strictly past the threshold and gets freed
+immediately -- the queue stays bounded at ~1 pending entry instead of
+growing with the prompt.
+
+Verified (2026-08-21/22): the same 88K-token solo-prompt repro that
+self-preempted at --max-num-batched-tokens=2048 (peak GPU-KV usage
+99.6%) now peaks at 54.9% with zero preemptions, at the same batch
+size -- and throughput actually improved (885 vs ~860 tok/s, since this
+also removes the reason --max-num-batched-tokens had to be dropped to
+1024 as a workaround). Correctness spot-checked with a needle-in-
+haystack recall test (unique code embedded ~44K tokens into an 88K-token
+prompt, greedy decoding) -- correctly recalled.
+
+--- a/v1/core/single_type_kv_cache_manager.py
++++ b/v1/core/single_type_kv_cache_manager.py
+@@ -6,6 +6,7 @@
+ from collections.abc import Sequence
+ from typing import ClassVar
+
++from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_utils import (
+@@ -32,6 +33,8 @@
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ from vllm.v1.request import Request
+
++logger = init_logger(__name__)
++
+
+ class SingleTypeKVCacheManager(ABC):
+     """
+@@ -1265,9 +1268,21 @@
+         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.mamba_cache_mode == "align":
+-            # Mapping from request ID to the index of the block
+-            # allocated in the previous step
+-            self.last_state_block_idx: dict[str, int] = {}
++            # FIFO queue, per request, of block indices superseded by a
++            # newer running-state block -- oldest (earliest-freeable) first.
++            # A single scalar here silently drops an entry it wasn't yet
++            # safe to free the moment the *next* step's allocate_new_blocks()
++            # overwrote it with a newer stale position, which is exactly
++            # what happens throughout a continuous chunked-prefill run (the
++            # freeing threshold and the newest stale index stay in lockstep
++            # -- equal, never strictly less -- the whole way through, so the
++            # scalar version never frees anything until decode begins). A
++            # queue lets every entry get its own turn: whenever the newest
++            # entry reaches the safety threshold, every *older* entry is
++            # already strictly past it and gets freed immediately, keeping
++            # the queue bounded at ~1 pending entry instead of growing with
++            # the prompt. See docs/mamba-align-prefill-leak.md.
++            self._stale_state_block_idxs: dict[str, list[int]] = {}
+             # The set of the requests that have been allocated blocks
+             self._allocated_block_reqs: set[str] = set()
+             # Requests that registered their own last-prompt-boundary partial
+@@ -1425,23 +1440,30 @@
+             request_id, processed_computed_tokens, num_prompt_tokens
+         )
+         if self.mamba_cache_mode == "align":
+-            # `last_state_block_idx` refers to the block index allocated two steps ago.
+-            # The block allocated in the previous step is used to copy Mamba states
+-            # into the block allocated in the current step; the earlier block is
+-            # no longer needed and should be freed here.
+-            last_state_block_idx = self.last_state_block_idx.get(request_id)
+-            # Blocks allocated during prefill may be non-contiguous. Use
+-            # `last_state_block_idx` to free the appropriate block and replace it
+-            # with a null block.
+-            if (
+-                last_state_block_idx is not None
+-                and last_state_block_idx
+-                < cdiv(processed_computed_tokens, self.block_size) - 1
+-            ):
++            # Each entry in the queue is a block index superseded by a newer
++            # running-state block at the time it was recorded. It becomes
++            # safe to free once processed_computed_tokens confirms progress
++            # has moved a full block past it -- same safety threshold as
++            # before, just applied to every pending entry instead of only
++            # the newest (see the queue's own docstring at declaration for
++            # why a scalar here silently drops entries).
++            threshold = cdiv(processed_computed_tokens, self.block_size) - 1
++            pending = self._stale_state_block_idxs.get(request_id)
++            if pending:
+                 blocks = self.req_to_blocks[request_id]
+-                if blocks[last_state_block_idx] != self._null_block:
+-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+-                    blocks[last_state_block_idx] = self._null_block
++                to_free: list[KVCacheBlock] = []
++                num_ready = 0
++                for idx in pending:
++                    if idx >= threshold:
++                        break
++                    num_ready += 1
++                    if blocks[idx] != self._null_block:
++                        to_free.append(blocks[idx])
++                        blocks[idx] = self._null_block
++                if num_ready:
++                    del pending[:num_ready]
++                if to_free:
++                    self.block_pool.free_blocks(to_free)
+
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+         """
+@@ -1567,13 +1589,15 @@
+                 if blocks_allocated:
+                     # We always save the running state at the last
+                     # (1 + num_speculative_blocks) block
+-                    self.last_state_block_idx[request_id] = (
++                    self._stale_state_block_idxs.setdefault(request_id, []).append(
+                         prev_block_len - 1 - self.num_speculative_blocks
+                     )
+                 elif prev_block_len > 0:
+                     # When a new request hits the prefix cache, the last block
+                     # saves the hit state.
+-                    self.last_state_block_idx[request_id] = prev_block_len - 1
++                    self._stale_state_block_idxs.setdefault(request_id, []).append(
++                        prev_block_len - 1
++                    )
+
+                 num_skipped_blocks = (
+                     num_required_blocks - self.num_speculative_blocks - 1
+@@ -1653,7 +1677,7 @@
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+-            self.last_state_block_idx.pop(request_id, None)
++            self._stale_state_block_idxs.pop(request_id, None)
+             self._producer_partial_tail_reqs.pop(request_id, None)
+             # A hand-off whose request died in this same scheduling pass must
+             # not reach the connector: its unpin hook (free) has already run.

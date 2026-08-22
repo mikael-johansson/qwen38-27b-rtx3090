@@ -1,10 +1,12 @@
 # Mamba-align prefill memory leak (self-preemption on large single prompts)
 
-Investigated 2026-08-21, branch `request_logging`. This is a real bug in
-upstream vLLM 0.27.1's `mamba_cache_mode=align` implementation, not a
-config problem in this repo. Current mitigation is a config change
-(`--max-num-batched-tokens 1024`, see below); this doc is the writeup for
-whoever chases the actual code fix later.
+Investigated and **fixed** 2026-08-21/22, branch `request_logging`. This
+was a real bug in upstream vLLM 0.27.1's `mamba_cache_mode=align`
+implementation, not a config problem in this repo. Fixed in
+`patches/mamba-align-stale-state-queue.patch`; `--max-num-batched-tokens`
+no longer needs to be held down to 1024 to avoid it (that was a
+mitigation, applied and then superseded once the real fix landed -- see
+below for whether `start_qwen.sh` has been reverted to 2048).
 
 [← back to the main README](../README.md)
 
@@ -58,9 +60,10 @@ confirmed yet).
 threshold `cdiv(processed_computed_tokens, block_size) - 1` increase in
 lockstep and stay exactly equal on every single step**, so the strict
 `<` comparison is never satisfied. Confirmed by direct instrumentation
-(`patches/preemption-mamba-align-freeing-debug-logging.patch`): logged
-every call to this check across a full 88K-token prefill, for all 3 of
-the model's Mamba/GDN KV-cache groups, at both
+(now removed -- it did its job; see the fix patch's changelog for the
+proof, or re-add a similar log at the same call site to re-derive it):
+logged every call to this check across a full 88K-token prefill, for all
+3 of the model's Mamba/GDN KV-cache groups, at both
 `max-num-batched-tokens=1024` and `=2048`:
 
 ```
@@ -113,20 +116,31 @@ At 1024, mamba's per-step "new block" request happens to get satisfied by
 reclaiming an already-null-padded slot rather than drawing fresh from the
 pool -- net cost is zero. At 2048, that reclaim doesn't happen, and 3
 never-freed blocks get drawn per step on top of attention's own real 2.
-**The exact code path that makes this alignment-dependent (why 1024
-reclaims and 2048 doesn't) was not traced to the line** -- the leak
-mechanism (the freeing check never firing) is proven with certainty; the
-modulating factor is measured with certainty; the precise null-slot-reuse
-code inside `MambaManager.allocate_new_blocks()`'s align branch
-(`single_type_kv_cache_manager.py`, roughly lines 1532-1600, past where
-this investigation stopped reading) that decides whether a "new" mamba
-block reuses a null slot vs. draws fresh is the next thing to read for
-anyone chasing the actual fix.
+
+**The alignment-dependent part traces to a *second*, separate freeing
+mechanism** -- not the align-specific `last_state_block_idx` check above
+(proven dead code during prefill), but the *base* class's
+`SingleTypeKVCacheManager.remove_skipped_blocks()`, which Mamba's
+`get_num_skipped_tokens()` override feeds almost the entire processed
+length (`num_computed_tokens - 1`, since Mamba only needs its latest
+state). That base method calls `_remove_blocks_in_range(request_id, 0,
+num_skipped_blocks)`, which scans **backward** from
+`num_skipped_blocks - 1` and **stops at the first null block it hits**.
+This is the mechanism that was *actually* freeing mamba blocks all
+along, purely by coincidence -- and whether it reaches the real
+(non-null) stale block before hitting an intervening null from the
+align-mode padding depends on how far `num_skipped_blocks` (itself
+derived from the same lagged `processed_computed_tokens`) falls behind
+the true block-list position, which is chunk-size sensitive: at 1024 it
+reliably reaches (confirmed: 106/106 real frees, exactly balancing 106
+real draws -- net zero growth); at 2048 it essentially never does
+(confirmed: 3 real frees over 189 calls, vs. 5 real draws every step --
+unbounded growth).
 
 At 2048 (the previous default), this ~2.5x-worse-than-necessary rate
-exhausts the pool after ~45 steps (~75K tokens) instead of comfortably
-holding the full 88K-token prompt, and the request self-preempts against
-*itself* -- no other request involved.
+exhausted the pool after ~45 steps (~75K tokens) instead of comfortably
+holding the full 88K-token prompt, and the request self-preempted
+against *itself* -- no other request involved.
 
 ## Why a preempted request succeeds on retry
 
@@ -146,59 +160,60 @@ remaining distance to hit the wall again:
 against a clean pool.** This is a coincidence of remaining distance, not
 a recovery of the underlying leak.
 
-## Current mitigation (applied, not a real fix)
+## The fix
 
-`single-user/start_qwen.sh`: `--max-num-batched-tokens` changed from
-`2048` to `1024` (old value left as a comment on the following line).
-Empirically zero-waste at this workload's token counts, and no measured
-throughput cost in testing (858-877 tok/s prefill either way -- this
-model/GPU combo isn't compute-bound at 1024 batched tokens). This
-directly contradicts `docs/gotchas.md` gotcha #7 ("2048 wins on this
-card") -- that gotcha predates this investigation and needs updating,
-since it was written on the assumption that the only effect of a bigger
-chunk was profiled-activation-memory shrinking cache pool size, not this
-leak.
+`patches/mamba-align-stale-state-queue.patch`. Deliberately does **not**
+touch the `<` comparison or `processed_computed_tokens` -- that threshold
+is a genuine GPU-synchronization safety margin (`num_in_flight_tokens`
+specifically excludes tokens whose GPU-side work isn't confirmed
+complete), not an off-by-one, and loosening it risked trading this
+preemption bug for a silent correctness bug (freeing Mamba state a
+kernel might still be reading). Instead it fixes the *tracking* bug:
+`last_state_block_idx: dict[str, int]` was a single scalar, overwritten
+every step regardless of whether the *previous* stale position had
+actually been freed. Since the freeing check stays in permanent lockstep
+during continuous prefill (proven above), every step's overwrite
+silently dropped the prior pending position before its own check ever
+got a chance to pass.
+
+Turned into a per-request FIFO queue (`_stale_state_block_idxs: dict[str,
+list[int]]`) instead. Same threshold, same safety margin, applied to
+every pending entry rather than only the newest. Because indices are
+strictly increasing and the newest one sits exactly *at* the threshold
+every step (the lockstep, proven above), every *older* pending entry is
+therefore already strictly *past* the threshold the moment the newest
+one is checked -- so it gets freed immediately. The queue stays bounded
+at ~1 pending entry instead of growing with the prompt, and the
+coincidental base-class fallback mechanism (the `_remove_blocks_in_range`
+scan described above) goes back to being irrelevant to Mamba, exactly as
+it was presumably intended to be.
+
+**Verified** (2026-08-21/22, `MAX_SEQS=1`, no other request involved):
+the same 88K-token solo prompt that self-preempted at
+`--max-num-batched-tokens=2048` (peak GPU-KV usage 99.6%, self-preempted)
+now peaks at **54.9%** with **zero preemptions**, at the same batch size
+-- essentially matching the pure-attention-cost expectation
+(ceil(88086/832) = 106 blocks needed; 124 observed, ~17% residual
+overhead, same small margin the 1024 mitigation achieved). Throughput
+improved too (885 vs. ~860 tok/s), since this also removes the reason
+`--max-num-batched-tokens` had to be held down to 1024 in the first
+place. Correctness spot-checked with a needle-in-haystack recall test
+(a unique 6-digit code embedded ~44K tokens into an 88K-token prompt,
+greedy decoding) -- correctly recalled.
+
+**`--max-num-batched-tokens` no longer needs to be held at 1024** for
+this reason. Whether `single-user/start_qwen.sh` has actually been
+reverted to 2048 is a separate question from whether the fix works --
+check the file's current value rather than assuming.
 
 **Do not** try `--max-num-batched-tokens 8192` or higher without
-re-checking `--gpu-memory-utilization` headroom first -- it caused a hard
-`torch.OutOfMemoryError` engine crash in testing (profiled activation
-memory at that batch size left ~70MB less room than the KV cache needed
-at the time; bumping `GPU_UTIL` to 0.94 worked around the startup check,
-but real per-step memory pressure at 8192 still crashed the engine mid-request).
-
-## What a real fix needs to address
-
-Two independent things could each move the needle, and neither was
-attempted live -- both touch Mamba recurrent-state correctness, not just
-performance, so they need someone who knows this code path's invariants
-before landing:
-
-1. **The freeing check itself.** The comment above the check says
-   `last_state_block_idx` refers to the block "allocated two steps ago"
-   -- implying a *deliberate* 1-2 step safety margin, not "should never
-   trigger during monotonic prefill." Naively changing the strict `<` to
-   `<=` was considered and explicitly **not** done live: freeing a
-   Mamba state block one step earlier than intended risks freeing state
-   that's still being read from (e.g. by an in-flight copy into the next
-   block), which would silently corrupt generated output rather than
-   just waste memory -- a much worse failure mode than the preemption
-   this investigation started from. Whether `<=` is actually safe depends
-   on exactly what "two steps ago" is protecting against, which wasn't
-   determined here.
-
-2. **The chunk-size-dependent null-slot reuse.** Given the measured 1024
-   vs. 2048 difference is entirely about whether the predicted per-step
-   mamba draw reclaims a null slot or asks the pool for a fresh block,
-   there may be a way to make that reclaim happen unconditionally
-   (independent of whether chunk size happens to align with block size)
-   without touching the freeing-check's timing at all. This looks like
-   the safer of the two angles to pursue, since it doesn't touch when
-   state actually gets freed -- only whether a "new" draw can reuse an
-   already-allocated (but null-marked) slot. Starting point:
-   `MambaManager.allocate_new_blocks()`'s `mamba_cache_mode == "align"`
-   branch in `single_type_kv_cache_manager.py` (~line 1532 onward as of
-   vLLM 0.27.1), specifically what happens after the null-block padding
-   loop, past where this investigation stopped reading.
+re-checking `--gpu-memory-utilization` headroom first, independent of
+this fix -- it caused a hard `torch.OutOfMemoryError` engine crash in
+testing (profiled activation memory at that batch size left ~70MB less
+room than the KV cache needed at the time; bumping `GPU_UTIL` to 0.94
+worked around the startup check, but real per-step memory pressure at
+8192 still crashed the engine mid-request -- unrelated to the mamba leak,
+this is pure activation-memory pressure from the larger chunk).
 
 ## Reproducing
 
@@ -217,13 +232,23 @@ Then, against a fresh server:
 echo "..." | venv/bin/python local_chat_test.py -p 4000
 ```
 
+To reproduce the *original* (pre-fix) bug rather than confirm the fix,
+revert `patches/mamba-align-stale-state-queue.patch` before starting the
+server.
+
 Diagnostic patches (apply on top of the base patch set, quiet by default
 -- gated on free blocks < 15% of pool, so normal short-prompt traffic
 won't spam `qwen.log`):
 - `patches/preemption-per-group-alloc-debug-logging.patch` -- per-KV-group block allocation breakdown
-- `patches/preemption-mamba-align-freeing-debug-logging.patch` -- the freeing-check trace
 - `patches/preemption-usage-debug-logging.patch` -- raw block-pool usage numbers
 - `patches/preemption-lookup-debug-logging.patch` -- prefix-cache hit sizes on preempted-request retries
 
-grep `qwen.log` for `request-logging preemption-debug:` to find all of
-the above.
+The freeing-check and `_remove_blocks_in_range` traces that proved the
+lockstep and the base-class fallback mechanism (respectively) were
+removed once they'd done their job; re-add a similar `logger.debug()` at
+`remove_skipped_blocks()` / `_remove_blocks_in_range()` in
+`single_type_kv_cache_manager.py` if re-deriving that proof is ever
+needed again.
+
+grep `qwen.log` for `request-logging preemption-debug:` to find the
+diagnostic patches' output.
