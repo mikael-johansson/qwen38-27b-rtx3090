@@ -1147,3 +1147,78 @@ the pattern actually observed.
 - CUDA crash: found once (3-way concurrent load), not reliably reproduced across 2 further attempts (one 3-way, one heavier 3-way), not fixed, not understood beyond "rare, `--async-scheduling` + block reuse/zeroing, unrelated to either offload patch based on the one instance traced (the crashing block had no pending job -- neither offload patch's mechanism was even engaged)."
 - The real fix for HIT_DIVERGED (synchronous offload-before-physical-reclaim, described above) needs deliberate, incremental implementation and the kind of extensive live-load testing the original leak fix received -- scope it with the user before starting.
 - Diagnostic tools left in the repo for next time: `simulate_hermes_traffic.py` (replays real captured traffic concurrently -- picks threads by requiring net message-count growth so it skips signatures that merge multiple distinct restarted conversations), `patches/offload-verbose-eviction-debug-logging.patch` (very chatty, temporary -- now also includes `MAMBA_FREE`/`STORE_JOB_BLOCKS` block-id-level tracing folded into it and into `mamba-align-stale-checkpoint-offload-slack.patch`; consider reverting once this investigation resumes and the noise isn't needed, or keep applied for the next debugging pass).
+
+## 2026-08-23 addendum: the "never had a store job queued" conclusion above is corrected -- HIT_DIVERGED fixed without the synchronous-store mechanism
+
+> **STATUS: FIXED.** `patches/offload-eagle-misclassification-mamba.patch`
+> (regenerated) + new `patches/hit-diverged-boundary-rescue.patch`. See
+> `HIT_DIVERGED_FIX_PLAN.md` (the plan this addendum executes) and
+> `RESULTS-hit-diverged.md` (the full measurement matrix) for the complete
+> writeup. The synchronous store-before-eviction block_pool<->connector
+> coupling recommended just above is **not needed on current evidence** --
+> kept here as a correct-but-superseded analysis, not deleted, per this
+> doc's append-and-correct convention.
+
+Direct trace analysis of two captured HIT_DIVERGED events (in
+`qwen.log.evidence-mamba-free-never-fired.log`, lines ~5102-5109 and
+~27848-27855) shows the "never had a store job queued" conclusion above
+is **wrong for both of them**. In the second event (request `...-9f40098d`,
+54,794-token prompt):
+
+```
+group 3 _maximal_prefix_lookup start_chunk_idx=48 scanned=17 hit_count=1 ... stop_reason=exhausted
+_sliding_window_lookup len(keys)=17 sliding_window_size=1 ... consecutive_hits=1 ... result=1
+_sliding_window_lookup len(keys)=1  sliding_window_size=1 ... consecutive_hits=1 ... result=1   (x2, mamba groups)
+group 3 _maximal_prefix_lookup start_chunk_idx=48 scanned=1 hit_count=1 defer_lookup=False
+HIT_DIVERGED RECONCILE -- diverged local hit was 39936 tokens, external connector confirmed 0, ...
+```
+
+The local attention hit was 48 chunks (39,936 tokens); every mamba group
+returned a confirmed HIT at chunk 48, and attention externally hit chunk
+48 too. The tier could fully back a resume at 40,768 tokens. Yet ext came
+back 0 and 39,936 tokens were discarded -- not because nothing was
+stored, but because of a second, independent bug: group 3 (full
+attention) was still classified as an EAGLE/MTP draft group by
+`SchedulerOffloadConfig.from_spec()`'s mark-everything fallback (the
+2026-08-22 fix above excluded only `MambaSpec` groups from that
+fallback, not group 3 itself). In `_lookup()`, an eagle group pops one
+provisional trailing chunk after a successful lookup
+(`num_hit_chunks -= 1`). Group 3's external hit was exactly 1 chunk ->
+popped to 0 -> `max_hit_size_tokens` collapses to the local boundary ->
+`return 0` -> the scheduler's reconcile fires and discards the whole deep
+hit. This fires on precisely the production pattern (turn N+1 of a
+conversation whose shared prefix is still mostly GPU-resident: the
+external hit beyond the local boundary is almost always exactly the
+previous turn's 1-2 decode-tail chunks) -- explaining why the earlier
+analysis, hand-tracing a *different*, genuinely-cold-content event, found
+a shallow local attention hit and concluded "content loss" while this
+mechanism (deep local hit, popped-to-zero external hit) was the dominant
+cause of the pattern actually driving the numbers.
+
+Runtime verification confirmed this model's MTP drafter's single
+attention layer (`mtp.layers.0.self_attn.attn`) genuinely does share KV
+cache group 3 with the target model's 16 full-attention layers (startup
+group dump, `patches/offload-eagle-misclassification-mamba.patch`), so
+the eagle guard is not a pure false positive here -- but the worst case
+of trusting the trailing chunk anyway is a briefly-stale draft-layer KV
+near a resume boundary, bounded to spec-decode acceptance rate since MTP
+drafts are always verified by the target model. Measured: mean spec-decode
+acceptance length ~2.9-3.3 (post-fix, 3-way traffic) vs ~2.7-3.0
+(pre-fix, evidence log) -- no regression. Fixed via
+`VLLM_OFFLOAD_EAGLE_FALLBACK=0` (micke-start.sh), which disables the
+fallback entirely rather than refining its group selection further.
+
+A second, smaller structural gap (`_lookup()` starts every group's scan
+strictly beyond the presented local boundary, so a mamba checkpoint
+sitting exactly at that boundary is invisible) is fixed separately by
+`patches/hit-diverged-boundary-rescue.patch`: a single retry, in the
+scheduler's reconcile branch, that re-queries the connector with the
+local boundary lowered by one mamba-align chunk before giving up.
+
+Net result (3-way replay of real captured traffic, ~11 min, 3 threads to
+40 turns each, comparable load to the 29-event/825K-token overnight
+baseline): **zero HIT_DIVERGED RECONCILE and zero RESCUED events** --
+Phase B alone eliminated every divergence this traffic pattern produces;
+the boundary-rescue retry in Phase C never needed to fire in this run
+(kept for the sub-block-boundary blind spot it targets, confirmed safe
+and inert). Full numbers: `RESULTS-hit-diverged.md`.
