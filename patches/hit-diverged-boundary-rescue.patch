@@ -1,0 +1,246 @@
+Fix: rescue a deep HIT_DIVERGED prefix hit when the offload tier can back
+it but the connector's lookup is structurally blind to the boundary chunk
+(vLLM 0.27.1, hybrid Mamba/GDN + full-attention models with mamba-align
+offloading).
+
+Root cause (second, smaller structural gap after
+patches/offload-eagle-misclassification-mamba.patch's 2026-08-23
+revision): OffloadingConnectorScheduler._lookup() starts every group's
+scan at start_chunk_idx = num_computed_tokens // tokens_per_chunk --
+strictly BEYOND the presented local boundary. A mamba checkpoint sitting
+exactly AT that boundary (chunk start_chunk_idx - 1, e.g. when the
+previous turn's decode never crossed the next 832-token align boundary)
+is invisible. The connector then legitimately answers ext=0 by API
+semantics ("N NEW tokens beyond the boundary"), and the core scheduler's
+HIT_DIVERGED reconcile -- correct for mamba-state safety when the tier
+truly can't back the boundary -- throws away the entire deep
+full-attention hit (30-50K tokens observed) and reprefills from the
+shallow common boundary, even though the tier held everything needed.
+
+The fix (v1/core/sched/scheduler.py, the
+`if hit_diverged and num_external_computed_tokens == 0:` branch): before
+reconciling down, re-query the connector ONCE with the presented local
+boundary lowered by exactly one mamba-align chunk
+(retry_local = round_down(block_aligned_local, align) - align):
+
+  - ext2 > 0: resume at retry_local + ext2 (>= the old deep boundary
+    rounded down to the align size; usually >= the old deep boundary,
+    since the tier typically also backs the previous turn's decode-tail
+    chunk beyond it). The local computed blocks are TRUNCATED to
+    retry_local (same truncate_computed_blocks helper the existing
+    "remote strictly exceeds local hit" path uses) so the boundary chunk
+    is re-loaded from the tier rather than adopted locally -- that is
+    what makes the mamba group's boundary chunk loadable at all. Cost:
+    one extra attention-chunk DMA (megabytes) instead of a full
+    reprefill. Logged as "HIT_DIVERGED RESCUED".
+  - ext2 is None (connector deferred: async backend lookup kicked off,
+    or the hit chunks are already being loaded): requeue the request for
+    the next schedule attempt, exactly like the first lookup's None
+    path. Never reconcile-and-recompute a hit the connector may yet
+    confirm.
+  - ext2 == 0: the tier genuinely can't back the boundary; fall through
+    to the existing reconcile ("HIT_DIVERGED RECONCILE") unchanged.
+
+Correctness invariants preserved (each verified against the code):
+  1. Never resume at a boundary without a confirmed-loadable mamba chunk
+     ending exactly there: the rescue only acts on ext2 > 0, which goes
+     through the connector's normal _lookup (per-group confirmed hits,
+     including the 1-chunk sliding-window mamba lookup) and
+     update_state_after_alloc load-job machinery. update_state_after_
+     alloc early-returns on num_external_tokens == 0; the rescue never
+     tries to load with ext==0.
+  2. get_num_new_matched_tokens is safe to repeat: it clears per-group
+     block_ids and re-sets num_locally_computed_tokens at entry, and an
+     in-flight transfer would already have made the FIRST call return
+     None (transfer_jobs is checked at entry), so the retry cannot race
+     a transfer the first call started.
+  3. At most ONE retry lookup per schedule attempt (straight-line code,
+     no loop); the deferred path requeues via the scheduler's existing
+     skipped-waiting mechanism.
+  4. Async scheduling: the rescue stays entirely inside the schedule()
+     lookup phase; nothing moves across the build_connector_meta()
+     boundary.
+  5. The align size is taken from the connector
+     (OffloadingConnectorScheduler._mamba_align_size via a new
+     get_mamba_align_size() accessor, exposed through
+     OffloadingConnector; the core scheduler looks it up with getattr,
+     so any other connector type simply skips the rescue), and the
+     retry boundary is checked for divisibility by the scheduler block
+     size before use -- truncate_computed_blocks asserts alignment for
+     every group's block size (mamba align = 832 here, a multiple of
+     both the mamba block and the attention block).
+
+Evidence for the blind spot: qwen.log.evidence-mamba-free-never-fired.log
+events at lines ~5102-5109 / ~27848-27855 (see
+docs/mamba-align-prefill-leak.md 2026-08-23 addendum and
+RESULTS-hit-diverged.md). Repro/verification:
+test_hit_diverged_rescue.sh, test_offload_regression.sh,
+needle_recall_test.py -- results in RESULTS-hit-diverged.md.
+
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -813,25 +813,115 @@
+                         if hit_diverged and num_external_computed_tokens == 0:
+                             # No external tokens back the deeper local hit, so its
+                             # resume boundary would have no valid Mamba state.
+-                            # Reconcile to the boundary every group agrees on.
++                            #
++                            # Before reconciling the whole deep hit away, give the
++                            # connector one more chance. The connector's lookup
++                            # only scans strictly BEYOND the presented boundary
++                            # (start_chunk_idx = boundary // chunk), so a mamba
++                            # checkpoint whose end sits exactly AT the boundary is
++                            # structurally invisible to it, and ext == 0 can mean
++                            # "blind spot", not "tier can't back it". Re-query
++                            # ONCE with the presented boundary lowered by one
++                            # mamba-align chunk: if the tier confirms a hit there,
++                            # resume from it -- costing one extra attention-chunk
++                            # DMA instead of a 30-50K-token reprefill. The
++                            # ext > 0 path reuses the connector's normal
++                            # _lookup/update_state_after_alloc machinery, which is
++                            # what guarantees a confirmed-loadable mamba chunk at
++                            # the resume boundary (never resume without one).
+                             pre_reconcile_local_hit = num_new_local_computed_tokens
+-                            (
+-                                new_computed_blocks,
+-                                num_new_local_computed_tokens,
+-                                request.shared_prefix_boundary,
+-                            ) = self.kv_cache_manager.get_computed_blocks(request)
+-                            logger.debug(
+-                                "request-logging offload-verbose: %s HIT_DIVERGED "
+-                                "RECONCILE -- diverged local hit was %d tokens, "
+-                                "external connector confirmed 0, reconciled down "
+-                                "to %d tokens (the boundary every KV group agrees "
+-                                "on) -- %d tokens of otherwise-valid hit discarded "
+-                                "for Mamba-state safety",
+-                                request.request_id,
+-                                pre_reconcile_local_hit,
+-                                num_new_local_computed_tokens,
+-                                pre_reconcile_local_hit - num_new_local_computed_tokens,
++                            rescued = False
++                            rescue_deferred = False
++                            get_align = getattr(
++                                self.connector, "get_mamba_align_size", None
+                             )
++                            align_size = (
++                                get_align() if get_align is not None else None
++                            )
++                            if (
++                                align_size is not None
++                                # truncate_computed_blocks needs the boundary
++                                # aligned to every group's block size.
++                                and align_size % self.block_size == 0
++                            ):
++                                retry_local = (
++                                    block_aligned_local
++                                    - block_aligned_local % align_size
++                                    - align_size
++                                )
++                                if retry_local > 0:
++                                    # Safe to repeat: get_num_new_matched_tokens
++                                    # clears per-group block_ids and re-sets
++                                    # num_locally_computed_tokens at entry. At
++                                    # most this ONE retry per schedule attempt.
++                                    ext2, load_kv_async2 = (
++                                        self.connector.get_num_new_matched_tokens(
++                                            request, retry_local
++                                        )
++                                    )
++                                    if ext2 is None:
++                                        # Connector needs more time (async lookup
++                                        # or in-flight transfer): requeue like the
++                                        # first lookup's None path -- never
++                                        # reconcile-and-recompute a hit the
++                                        # connector may yet confirm.
++                                        rescue_deferred = True
++                                    elif ext2 > 0:
++                                        # Present the correspondingly TRUNCATED
++                                        # local blocks so the boundary chunk is
++                                        # re-loaded from the tier instead of
++                                        # adopted locally -- that is what makes
++                                        # the mamba group's boundary chunk
++                                        # loadable at all.
++                                        new_computed_blocks = (
++                                            self.kv_cache_manager
++                                            .truncate_computed_blocks(
++                                                new_computed_blocks, retry_local
++                                            )
++                                        )
++                                        num_new_local_computed_tokens = retry_local
++                                        num_external_computed_tokens = ext2
++                                        load_kv_async = load_kv_async2
++                                        rescued = True
++                                        logger.debug(
++                                            "request-logging offload-verbose: %s "
++                                            "HIT_DIVERGED RESCUED -- deep hit %d "
++                                            "kept, resumed at %d via retry-lookup "
++                                            "(local boundary lowered to %d, "
++                                            "external backed %d tokens)",
++                                            request.request_id,
++                                            pre_reconcile_local_hit,
++                                            retry_local + ext2,
++                                            retry_local,
++                                            ext2,
++                                        )
++                            if rescue_deferred:
++                                request_queue.pop_request()
++                                step_skipped_waiting.prepend_request(request)
++                                continue
++                            if not rescued:
++                                # The tier genuinely can't back the boundary.
++                                # Reconcile to the boundary every group agrees on.
++                                (
++                                    new_computed_blocks,
++                                    num_new_local_computed_tokens,
++                                    request.shared_prefix_boundary,
++                                ) = self.kv_cache_manager.get_computed_blocks(
++                                    request
++                                )
++                                logger.debug(
++                                    "request-logging offload-verbose: %s HIT_DIVERGED "
++                                    "RECONCILE -- diverged local hit was %d tokens, "
++                                    "external connector confirmed 0, reconciled down "
++                                    "to %d tokens (the boundary every KV group agrees "
++                                    "on) -- %d tokens of otherwise-valid hit discarded "
++                                    "for Mamba-state safety",
++                                    request.request_id,
++                                    pre_reconcile_local_hit,
++                                    num_new_local_computed_tokens,
++                                    pre_reconcile_local_hit
++                                    - num_new_local_computed_tokens,
++                                )
+ 
+                         connector_prefix_cache_queries = (
+                             request.num_tokens - num_new_local_computed_tokens
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -956,6 +956,13 @@
+             request.num_prompt_tokens,
+         )
+ 
++    def get_mamba_align_size(self) -> int | None:
++        """The mamba-align offload chunk size (tokens), or None if no group
++        needs mamba alignment. Used by the core scheduler's HIT_DIVERGED
++        boundary-rescue retry to lower the presented local boundary by
++        exactly one align chunk (see vllm/v1/core/sched/scheduler.py)."""
++        return self._mamba_align_size
++
+     def get_num_new_matched_tokens(
+         self, request: Request, num_computed_tokens: int
+     ) -> tuple[int | None, bool]:
+--- a/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+@@ -142,6 +142,13 @@
+         assert self.connector_scheduler is not None
+         self.connector_scheduler.on_new_request(request)
+ 
++    def get_mamba_align_size(self) -> int | None:
++        # Duck-typed accessor for the core scheduler's HIT_DIVERGED
++        # boundary-rescue retry (looked up via getattr; connectors without
++        # it simply skip the rescue).
++        assert self.connector_scheduler is not None
++        return self.connector_scheduler.get_mamba_align_size()
++
+     def get_num_new_matched_tokens(
+         self, request: "Request", num_computed_tokens: int
+     ) -> tuple[int | None, bool]:
