@@ -1,0 +1,256 @@
+Give the KV-offload connector a real window to back up a Mamba align-mode
+state checkpoint before it's freed, closing (as far as architecturally
+possible) the dominant remaining cause of wasted recompute found in
+2026-08-22's live/simulated-traffic investigation (see
+docs/mamba-align-prefill-leak.md's "Offload eviction race" section).
+
+Root cause this addresses: in `mamba_cache_mode="align"`, a Mamba/GDN
+layer's KV cache is a single running state, not a chain of independently
+resumable positions like full attention. `single_type_kv_cache_manager.py`'s
+`MambaManager.remove_skipped_blocks()` (the code
+`patches/mamba-align-stale-state-queue.patch` fixed the leak in) frees the
+*previous* checkpoint block the moment `processed_computed_tokens` confirms
+a newer one has superseded it -- by design, usually within 1-2 scheduling
+steps of that request's own forward progress. This has nothing to do with
+cross-request memory pressure; it happens even completely uncontended.
+
+The problem: when a *later* request (e.g. the next turn of the same
+conversation) does its prefix-cache lookup, hybrid models check each KV
+group independently (`kv_cache_manager.py`'s `get_computed_blocks_for_
+connector`). Full attention's hit can run far deeper than Mamba's, because
+attention retains every block while Mamba only ever offers its single
+latest checkpoint. When that happens ("hit_diverged"), scheduler.py asks
+the KV connector to independently confirm the deeper boundary is safe
+before using it -- and if the connector has nothing stored for Mamba at
+that exact position (because the block was freed 1-2 steps after creation,
+long before any offload could plausibly catch up), the *entire* deeper hit
+gets discarded, not just the Mamba portion, falling back to the shallow
+boundary every group agrees on:
+
+  scheduler.py:813 -- "if hit_diverged and num_external_computed_tokens
+  == 0: ... Reconcile to the boundary every group agrees on."
+
+Confirmed directly with added instrumentation (temporary, this session):
+one 20-minute, 3-way concurrent simulated-traffic run hit this reconcile
+branch 29 times, discarding 825,344 tokens of otherwise-valid hit (avg
+28,460 tokens/event, up to 49,920 in one event) -- almost certainly the
+dominant contributor to the multi-million-token waste measured earlier in
+this investigation.
+
+`patches/offload-flush-protect-running-request-blocks.patch` (this same
+investigation, earlier) already guarantees an *in-flight* store completes
+before its block is reused. It cannot help here: there is no in-flight
+store to protect, because the checkpoint is freed by the owning request's
+own normal progress before a store could ever be created for it. The
+window this patch closes is *before* that fix's window even opens.
+
+The fix: `VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS` (new env var, default 0 =
+no behavior change). When set to N > 0, a superseded checkpoint stays
+retained for N extra confirmed-block-boundaries past the existing minimum
+GPU-write safety margin (untouched -- same threshold, same comparison,
+per that patch's own docstring on why loosening it risked a correctness
+bug) before it becomes eligible to free. This gives the connector's
+`_build_store_jobs()` (which now runs, and registers for flush-protection,
+every scheduling step per the earlier fix in this investigation) N more
+steps of real wall-clock time to actually create and complete a store for
+that specific position before it's gone.
+
+Bounded by construction: the pending-checkpoint queue's steady-state
+depth grows from ~1 entry to ~(1 + N) entries -- never unbounded -- so
+this cannot reintroduce the leak `mamba-align-stale-state-queue.patch`
+fixed. It is a real GPU memory cost though: N extra blocks retained per
+Mamba/GDN group (3 in this deployment) per concurrently-active
+mamba-align request.
+
+============================================================================
+UPDATE 2026-08-23 (overnight, autonomous testing): measured. Does NOT
+reliably help. NOT wired into micke-start.sh -- leave
+VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS unset (default 0).
+============================================================================
+
+Same 20-min, 3-way concurrent simulated-traffic test (identical replayed
+real conversation content each run, `simulate_hermes_traffic.py --threads 3
+--max-turns 20`), varying only this setting:
+
+  slack=0 (baseline, earlier session): 29 events / 825,344 tokens
+  slack=2, run 1:                      41 events / 1,108,224 tokens
+  slack=2, run 2:                      31 events / 876,928 tokens
+  slack=8, run 1:                      38 events / 1,002,560 tokens
+
+slack=2's two runs bracket the baseline (41 and 31 vs 29) -- run-to-run
+timing variance in which requests happen to overlap is comparable to or
+larger than any effect from the setting itself. slack=8 (4x the dose)
+shows no improvement either -- if anything, both non-zero settings trend
+slightly worse, though within noise. No dose-response signal in either
+direction.
+
+Root cause of *why* this doesn't help, traced directly (not just
+inferred from the null result): picked a specific HIT_DIVERGED event and
+walked its instrumentation back to `on_new_request` -- the shallow
+Mamba-side hit (consistently exactly 4 chunks / 3,328 tokens for one
+recurring conversation, across every single run regardless of slack
+value) was already fixed *before this request even started*. It's
+inherited from whatever GPU state survived from an earlier turn, not
+from anything this patch's slack window could affect (that window only
+applies to a request's *own* in-progress superseding, not to what
+happens to a block after the owning request has long since finished).
+
+Checked whether this is `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`-driven
+sparse retention (a separate, pre-existing upstream vLLM mechanism that
+controls which Mamba positions ever get hash-registered as cache-
+discoverable at all, independent of eviction timing --
+`MambaManager.reachable_block_mask()` in this same file). Ruled out:
+that env var is unset in this deployment, so
+`reachable_block_mask` returns `None` (dense -- every block is supposed
+to get cache-registered), confirmed by reading the code and checking the
+live process's environment.
+
+CONFIRMED, not just inferred (added `MAMBA_FREE`/`STORE_JOB_BLOCKS`
+block-id-level tracing, same session): `remove_skipped_blocks()`'s
+stale-superseding freeing branch -- the exact mechanism this patch's
+slack targets -- **never fired even once** across a full 2-thread,
+12-turn-each concurrent run, while HIT_DIVERGED still fired twice in
+that same run (43,264 tokens discarded). This isn't a race this patch
+is merely too small to win -- the mechanism it delays literally never
+ran. Also noticed, tracing one event by hand: the *full-attention*
+group's own local hit was equally shallow (4 chunks, not deep) for the
+divergent request -- attention has no supersede-and-free behavior at
+all, so a shallow attention hit rules out anything mamba-specific and
+points at plain content loss (never computed yet by this fresh
+server, or evicted by ordinary cross-request pool pressure) instead.
+
+Corrected conclusion: this is the *same* general cross-request eviction
+race `patches/offload-flush-protect-running-request-blocks.patch`
+(earlier this investigation) targets -- not a Mamba-checkpoint-lifecycle
+problem at all. That earlier fix protects blocks with an *already-
+registered* store job; it does not (and structurally cannot, as built)
+help when no job was ever queued for the lost content before it got
+reclaimed. Under heavy 2-3-way concurrent load this deployment's local
+GPU pool churns fast -- confirmed earlier this same investigation via
+`offload-verbose: REALLOC N block(s)` instrumentation showing dozens of
+blocks reallocated in single scheduling steps, and `block_pool.py`'s
+`get_usage()` traces showing sustained 70-80%+ pool utilization under
+this load -- and a block freed by *any* path is a candidate for
+*immediate* reuse by another concurrent request the moment nothing is
+registered to protect it.
+
+What would actually work: not "wait longer before letting go" but "never
+let go until backed up" -- a synchronous or near-synchronous store
+triggered by the *eviction* decision itself (in `block_pool.py`'s
+`_maybe_evict_cached_block`/`get_new_blocks`), not by a fixed time
+budget. That requires new coupling between `block_pool.py` (which
+currently has zero connector awareness by design) and the offloading
+connector -- e.g. a callback hook plus a block_id -> (req_id, group_idx,
+chunk_idx) reverse index the connector would need to maintain. Real,
+substantially larger scope than this patch, touching the exact
+subsystem responsible for the original leak, a suspected hang, and a
+CUDA illegal-memory-access crash found earlier in this same
+investigation (see docs/mamba-align-prefill-leak.md). Do not attempt
+without careful, incremental implementation and the kind of extensive
+live-load testing the original leak fix received -- not something to
+unilaterally build overnight.
+
+The mechanism this patch adds (a bounded, opt-in retention slack) is
+still real, correct, and safe to keep available -- it's just not, on its
+own, sufficient to close this gap at doses this deployment's VRAM budget
+can afford. Left in place, defaulted off, in case it's useful as one
+component of a future fix (e.g. combined with the synchronous-store
+approach above) rather than a complete solution by itself.
+
+--- a/envs.py
++++ b/envs.py
+@@ -187,6 +187,9 @@
+     VLLM_MARLIN_TUNE: bool = False
+     VLLM_MARLIN_TUNE_DIR: str = ""
+     VLLM_SPEC_DECODE_ATTN: bool = False
++    # request-logging patch: mamba-align stale-checkpoint offload slack (see
++    # patches/mamba-align-stale-checkpoint-offload-slack.patch)
++    VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS: int = 0
+     VLLM_DRAFT_TOPK_TOPP: bool = True
+     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+@@ -1479,6 +1482,20 @@
+     "VLLM_MARLIN_TUNE": lambda: os.environ.get("VLLM_MARLIN_TUNE", "0") == "1",
+     "VLLM_MARLIN_TUNE_DIR": lambda: os.environ.get("VLLM_MARLIN_TUNE_DIR", ""),
+     "VLLM_SPEC_DECODE_ATTN": lambda: os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1",
++    # request-logging patch: number of extra, already-superseded Mamba
++    # align-mode state-checkpoint blocks to keep retained (per request, per
++    # Mamba/GDN group) beyond the minimum GPU-write safety margin, so a KV
++    # offload connector has a real window to store one before it's freed and
++    # reused. 0 (default) = no change from upstream behavior. See
++    # patches/mamba-align-stale-checkpoint-offload-slack.patch -- bounded
++    # (the pending-checkpoint queue still can't grow past this fixed slack
++    # plus the existing ~1-entry minimum), so this cannot reintroduce the
++    # unbounded leak that patches/mamba-align-stale-state-queue.patch fixed.
++    # Each retained block costs real GPU memory (per Mamba/GDN group, per
++    # concurrently-active mamba-align request) -- keep this small.
++    "VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS": lambda: int(
++        os.environ.get("VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS", "0")
++    ),
+     "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
+     # The activation dtype config for humming kernel
+     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
+--- a/v1/core/single_type_kv_cache_manager.py
++++ b/v1/core/single_type_kv_cache_manager.py
+@@ -6,6 +6,8 @@
+ from collections.abc import Sequence
+ from typing import ClassVar
+ 
++import vllm.envs as envs
++from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_utils import (
+@@ -32,6 +34,8 @@
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ from vllm.v1.request import Request
+ 
++logger = init_logger(__name__)
++
+ class SingleTypeKVCacheManager(ABC):
+     """
+     An abstract base class for a manager that handle the kv cache management
+@@ -1422,7 +1426,22 @@
+             request_id, processed_computed_tokens, num_prompt_tokens
+         )
+         if self.mamba_cache_mode == "align":
+-            threshold = cdiv(processed_computed_tokens, self.block_size) - 1
++            # request-logging offload slack: hold a superseded checkpoint
++            # block for VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS extra positions
++            # past the minimum GPU-write safety margin before it's eligible
++            # to free, giving a KV offload connector a real window to store
++            # it first. 0 (default) reproduces the original threshold
++            # exactly -- no behavior change unless explicitly configured.
++            # Still fully bounded: the pending queue's steady-state depth
++            # just grows from ~1 entry to ~(1 + slack) entries, never
++            # unboundedly, so this can't reintroduce the leak that
++            # patches/mamba-align-stale-state-queue.patch fixed. See
++            # patches/mamba-align-stale-checkpoint-offload-slack.patch.
++            threshold = (
++                cdiv(processed_computed_tokens, self.block_size)
++                - 1
++                - envs.VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS
++            )
+             pending = self._stale_state_block_idxs.get(request_id)
+             if pending:
+                 blocks = self.req_to_blocks[request_id]
+@@ -1435,6 +1454,19 @@
+                     to_free: list[KVCacheBlock] = []
+                     for idx in pending[:num_ready]:
+                         if blocks[idx] != self._null_block:
++                            logger.debug(
++                                "request-logging offload-verbose: %s "
++                                "MAMBA_FREE group=%d chunk_idx=%d block_id=%d "
++                                "processed_computed_tokens=%d threshold=%d "
++                                "slack=%d",
++                                request_id,
++                                self.kv_cache_group_id,
++                                idx,
++                                blocks[idx].block_id,
++                                processed_computed_tokens,
++                                threshold,
++                                envs.VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS,
++                            )
+                             to_free.append(blocks[idx])
+                             blocks[idx] = self._null_block
+                     del pending[:num_ready]

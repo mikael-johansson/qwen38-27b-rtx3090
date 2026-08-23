@@ -948,3 +948,202 @@ regresses on a later turn of an already-longer thread, especially back
 down to a fixed floor it had already exceeded) shows up again in
 `qwen.log`/`requests/*.log`, this fix did not fully close the gap and
 needs another look.
+
+## Overnight follow-up (2026-08-23): the deeper HIT_DIVERGED mechanism, a real fix, and a real crash bug -- both found, only one closed
+
+Continuation of the above, done autonomously overnight per the user's
+request to keep iterating. Built `simulate_hermes_traffic.py` (repo root)
+to replay real captured `requests/*.log` conversation threads
+concurrently against a live server, reproducing the two/three-large-
+concurrent-conversation load pattern without needing to wait for live
+traffic. Added `patches/offload-verbose-eviction-debug-logging.patch`
+(temporary, extremely verbose `logger.debug()` instrumentation across
+the store/lookup/eviction paths, tagged `request-logging offload-verbose:`)
+to see the mechanism directly instead of inferring it from aggregate
+stats.
+
+### A real CUDA crash, found once, not reliably reproduced
+
+First 3-way concurrent simulation run crashed the server entirely:
+`torch.AcceleratorError: CUDA error: an illegal memory access was
+encountered`, in flashinfer's attention-metadata builder, right as
+`new_block_ids_to_zero=[36]` fired for a block that the instrumentation
+showed had just been reallocated with **no pending store job** (i.e. not
+a case my earlier flush-protect fix's mechanism would have touched
+either way -- nothing was pending to flush). Two more attempts at the
+same and heavier (3-way, longer) load did not reproduce it. Rare,
+timing-dependent, most likely in vLLM's `--async-scheduling` interaction
+with block reuse/zeroing under sustained heavy load -- a pre-existing
+bug this investigation happened to expose, not something either offload
+patch caused. **Not fixed. Still open.** If it recurs, `qwen.log` will
+have the exact traceback; search for `AcceleratorError` or
+`new_block_ids_to_zero`.
+
+### The real dominant cause of wasted recompute: HIT_DIVERGED reconciliation
+
+Traced the majority of wasted-recompute tokens to a *different, deeper*
+mechanism than the eviction race fixed earlier: `scheduler.py`'s hybrid
+prefix-cache lookup (`get_computed_blocks_for_connector`) can find a
+much deeper hit on the full-attention KV group than on the Mamba/GDN
+groups (Mamba only ever has a *single* running-state checkpoint, not a
+retained chain like attention). When that "hit_diverged" and the
+external offload connector can't independently confirm the deeper
+boundary is Mamba-safe (`num_external_computed_tokens == 0`), the
+scheduler throws away the **entire** deep hit, not just the Mamba
+portion, and falls back to the shallow boundary every KV group agrees
+on -- this is `scheduler.py`'s own comment: "Reconcile to the boundary
+every group agrees on." This is a genuine, intentional *correctness*
+safety check (using Mamba state from an unconfirmed position would
+silently corrupt generation), not a bug to remove.
+
+Added one log line at this exact branch
+(`request-logging offload-verbose: %s HIT_DIVERGED RECONCILE`) and
+confirmed it directly: one 20-minute, 3-way concurrent run hit it 29
+times, discarding 825,344 tokens (avg 28,460/event, up to 49,920 in one
+event) of otherwise-valid hit. This is almost certainly the dominant
+contributor to the multi-million-token waste measured across this whole
+investigation -- far larger than the narrower eviction-race gap the
+earlier `offload-flush-protect-running-request-blocks.patch` closed.
+
+### Attempted fix: retention slack for stale Mamba checkpoints -- tested, does not reliably help
+
+Root cause of the divergence: `MambaManager.remove_skipped_blocks()`
+(the code the leak fix touched) frees a superseded Mamba checkpoint
+block within 1-2 scheduling steps of the *owning request's own* forward
+progress -- nothing to do with cross-request pressure, it happens even
+uncontended. By the time a *later* request (next turn, new request_id)
+looks for that position, it's long gone, with never any real window for
+an offload store to have caught it.
+
+Built `patches/mamba-align-stale-checkpoint-offload-slack.patch`: a new
+`VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS` env var (default 0, no behavior
+change) that holds a superseded checkpoint for N extra confirmed-block-
+boundaries before it's freed, bounded by construction (queue depth grows
+from ~1 to ~(1+N) entries, never unbounded -- cannot reintroduce the
+original leak).
+
+**Measured overnight, does not reliably help.** Same simulation, only
+the slack value varied:
+
+| slack | run | events | tokens discarded |
+|---|---|---|---|
+| 0 (baseline) | -- | 29 | 825,344 |
+| 2 | run 1 | 41 | 1,108,224 |
+| 2 | run 2 | 31 | 876,928 |
+| 8 | run 1 | 38 | 1,002,560 |
+
+slack=2's two runs (41, 31) bracket the baseline (29) -- run-to-run
+timing variance in which concurrent requests happen to overlap is as
+large as or larger than any effect from the setting. slack=8 (4x dose)
+shows no improvement either. No dose-response signal.
+
+Traced *why* directly: picked one recurring HIT_DIVERGED event (a
+specific conversation whose Mamba-side hit is stuck at exactly 4 chunks
+/ 3,328 tokens in **every single run**, regardless of slack value) and
+confirmed the shallow hit is already fixed before the new request even
+starts -- inherited from whatever survived from an earlier turn, outside
+this patch's window entirely (the window only covers a request's *own*
+in-progress checkpoint superseding). Ruled out
+`VLLM_PREFIX_CACHE_RETENTION_INTERVAL` (a separate, pre-existing
+upstream sparse-retention mechanism, unset here, confirmed
+`reachable_block_mask()` returns dense/`None`). Best-supported remaining
+explanation: under this deployment's heavy 2-3-way concurrent load, the
+local GPU pool churns fast enough (confirmed via the `REALLOC N block(s)`
+instrumentation and `block_pool.py` usage traces showing sustained
+70-80%+ utilization) that a small, VRAM-affordable slack (2-8 blocks) is
+negligible against how quickly a freed block's physical slot gets
+reclaimed by *some other* concurrent request's next allocation. A slack
+large enough to reliably win that race would cost far more VRAM than
+this "living on the edge" deployment can spare.
+
+**Recommendation: leave `VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS` unset
+(default 0) in `micke-start.sh`.** The mechanism is real, safe, and
+harmless at 0 -- just not sufficient alone. A fix that would actually
+work: trigger the store synchronously from the *eviction* decision
+itself (`block_pool.py`'s `_maybe_evict_cached_block`/`get_new_blocks`)
+rather than racing a fixed time budget -- "never let go until backed up"
+instead of "hold on a little longer." That requires new coupling between
+`block_pool.py` (currently zero connector-awareness by design) and the
+offloading connector (a callback hook, plus a
+block_id -> (req_id, group_idx, chunk_idx) reverse index the connector
+would need to maintain) -- a substantially larger change than anything
+in this investigation so far, touching the exact subsystem responsible
+for the original leak, a suspected hang, and the CUDA crash above. Not
+attempted here -- recommend scoping and reviewing this deliberately
+rather than building it unsupervised overnight.
+
+### Retention-slack attempt (`VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS`) -- tested overnight, ruled out with direct proof
+
+Hypothesis going into this: `MambaManager.remove_skipped_blocks()` frees a
+superseded Mamba checkpoint within 1-2 steps of the *owning request's own*
+forward progress, before an offload store could plausibly catch it. Built
+`patches/mamba-align-stale-checkpoint-offload-slack.patch` (new env var,
+default 0/off, bounded by construction) to hold a superseded checkpoint N
+extra steps before freeing, giving the connector more time.
+
+**Measured: does not reliably help.** Same 20-min 3-way concurrent
+simulated-traffic test, only the slack value varied:
+
+| slack | events | tokens discarded |
+|---|---|---|
+| 0 (baseline) | 29 | 825,344 |
+| 2 (run 1) | 41 | 1,108,224 |
+| 2 (run 2) | 31 | 876,928 |
+| 8 (run 1) | 38 | 1,002,560 |
+
+slack=2's two runs bracket the baseline -- run-to-run timing variance
+dominates at this dose. slack=8 (4x) shows no improvement either. No
+dose-response signal.
+
+**Then proven wrong, not just unhelpful:** added block-id-level tracing
+(`MAMBA_FREE` in `remove_skipped_blocks`, `STORE_JOB_BLOCKS` in
+`_build_store_jobs`) and ran a fresh 2-thread, 12-turn-each test.
+`remove_skipped_blocks()`'s stale-superseding freeing branch —
+the exact mechanism the slack targets — **fired zero times in the
+entire run**, while HIT_DIVERGED still fired twice (43,264 tokens
+discarded). The mechanism this patch delays literally never ran; it
+isn't a race the patch is too small to win, it's the wrong race
+entirely for the dominant pattern. Confirmed further by hand-tracing one
+event: the *full-attention* group's own local hit was equally shallow
+(4 chunks) for the divergent request. Attention has no supersede-and-
+free behavior at all, so a shallow attention hit rules out anything
+Mamba-checkpoint-specific and points at plain content loss instead —
+either genuinely never computed yet by a freshly-restarted server, or
+evicted by ordinary cross-request pool pressure.
+
+**Corrected conclusion:** HIT_DIVERGED's dominant cause is the *same*
+general cross-request eviction race `offload-flush-protect-running-
+request-blocks.patch` (earlier this investigation) targets, not a
+Mamba-checkpoint-lifecycle problem. That earlier fix protects blocks
+with an *already-registered* store job; it structurally cannot help
+when no job was ever queued for the lost content before it got
+reclaimed by another concurrent request's allocation, under this
+deployment's confirmed 70-80%+ pool utilization and dozens-of-blocks-
+per-step reallocation churn under 2-3-way concurrent load.
+
+**What would actually work:** not "wait longer before letting go" but
+"never let go until backed up" -- a synchronous or near-synchronous
+store triggered by the *eviction* decision itself
+(`block_pool.py`'s `_maybe_evict_cached_block`/`get_new_blocks`), not a
+fixed time budget. Requires new coupling between `block_pool.py`
+(currently zero connector awareness by design) and the offloading
+connector -- a callback hook plus a
+`block_id -> (req_id, group_idx, chunk_idx)` reverse index the
+connector would need to maintain. Substantially larger scope than
+anything built so far in this investigation, touching the exact
+subsystem responsible for the original leak, a suspected hang, and the
+CUDA crash below. **Not attempted -- recommend scoping and reviewing
+this deliberately with the user rather than building it unsupervised.**
+
+**Recommendation: leave `VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS` unset
+(default 0) in `micke-start.sh`.** The mechanism is safe and inert at
+0; just not sufficient, and now confirmed not even the right lever for
+the pattern actually observed.
+
+### Status for next session
+- Eviction-race fix (`offload-flush-protect-running-request-blocks.patch`): applied, real, correctly-targeted mechanism, but confirmed (via `MAMBA_FREE`/`STORE_JOB_BLOCKS` tracing above) to only cover part of the actual gap -- it protects blocks with an already-registered job, and most of the loss happens to blocks that never had one queued at all.
+- HIT_DIVERGED reconciliation: root-caused precisely, twice now (once at the reconciliation-branch level, once down to "no job was ever queued" at the block level). **Not fixed.** Dominant remaining source of wasted recompute.
+- Retention-slack attempt: built, tested at 3 doses, and definitively ruled out (wrong mechanism, not just insufficient) via direct block-id tracing. Left in place, defaulted off, real and safe but not useful on its own.
+- CUDA crash: found once (3-way concurrent load), not reliably reproduced across 2 further attempts (one 3-way, one heavier 3-way), not fixed, not understood beyond "rare, `--async-scheduling` + block reuse/zeroing, unrelated to either offload patch based on the one instance traced (the crashing block had no pending job -- neither offload patch's mechanism was even engaged)."
+- The real fix for HIT_DIVERGED (synchronous offload-before-physical-reclaim, described above) needs deliberate, incremental implementation and the kind of extensive live-load testing the original leak fix received -- scope it with the user before starting.
+- Diagnostic tools left in the repo for next time: `simulate_hermes_traffic.py` (replays real captured traffic concurrently -- picks threads by requiring net message-count growth so it skips signatures that merge multiple distinct restarted conversations), `patches/offload-verbose-eviction-debug-logging.patch` (very chatty, temporary -- now also includes `MAMBA_FREE`/`STORE_JOB_BLOCKS` block-id-level tracing folded into it and into `mamba-align-stale-checkpoint-offload-slack.patch`; consider reverting once this investigation resumes and the noise isn't needed, or keep applied for the next debugging pass).

@@ -1,0 +1,318 @@
+TEMPORARY diagnostic-only patch, not a fix. Extremely verbose `logger.debug()`
+instrumentation across the KV-offload connector's store/lookup/eviction
+paths, added 2026-08-22 to investigate the residual gap left by
+`patches/offload-flush-protect-running-request-blocks.patch`: even after
+that fix, live production traffic (two large concurrent Hermes Agent
+conversations) still showed ~24% of all prompt-token processing going to
+unnecessary full recomputes in a 30-minute window, including at least one
+request with *zero* offloading store-job activity for its entire ~61K-
+token lifetime -- a different-looking failure mode than the "job created
+but raced by eviction" one the prior fix targeted. This patch adds enough
+log detail to distinguish, for any future occurrence, between: (a) the
+request's own req_status was never created (`on_new_request` never fired
+for it), (b) `_build_store_jobs` ran but every group's `storable_chunks`
+never advanced past `start_chunk_idx` (nothing new considered "storable"
+despite real new content), (c) `prepare_store`/`keys_to_store` came back
+empty (primary-tier allocation issue), (d) a block got evicted
+(`block_pool.py`'s `_maybe_evict_cached_block`) that had no pending job
+registered for it at all (the residual gap itself, made directly visible
+instead of inferred), and (e) a prefix-hit lookup scan
+(`_maximal_prefix_lookup` / `_sliding_window_lookup`) stopped early and
+exactly where/why (MISS vs RETRY-deferred).
+
+All new lines are tagged `request-logging offload-verbose:` for easy
+grep. Meant to run only long enough to catch the pattern live, then be
+reverted -- this is deliberately much chattier than anything that should
+stay in a production log long-term (a per-request-per-group summary line
+on every offload-relevant scheduler step, plus one line per eviction of
+real cached content). Requires `VLLM_LOGGING_CONFIG_PATH` to route the
+`vllm` logger at DEBUG to a file (already the case in this repo's
+`single-user/logging-to-file-debug.json`, already wired up in
+`micke-start.sh`) -- otherwise these lines are silently dropped and cost
+only the (cheap, lazy-formatted) `logger.debug()` call overhead.
+
+Requires a server restart to take effect (this only edits the venv's
+installed vLLM source, not a running process).
+
+To analyze once collected: grep `qwen.log` for
+`request-logging offload-verbose:`, correlate by request_id and, for the
+eviction/realloc lines, by block_id and log timestamp (block_pool.py's
+`EVICT block_id=N` lines and offloading/scheduler.py's
+`REALLOC .../FLUSH ...` lines are in different files/loggers but share
+vLLM's own log timestamp format, so nearby timestamps + matching block_id
+identify the same event from both sides).
+
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -593,7 +593,10 @@
+         or None if the backend deferred a lookup."""
+         hit_count = 0
+         defer_lookup = False
++        total_keys = 0
++        stop_reason = "exhausted"
+         for local_idx, key in enumerate(keys):
++            total_keys += 1
+             result = self.manager.lookup(key, req_context)
+             match result:
+                 case LookupResult.HIT:
+@@ -612,7 +615,20 @@
+                     # async lookups (until a miss is detected).
+                     defer_lookup = True
+                 case LookupResult.MISS:
++                    stop_reason = f"MISS at local_idx={local_idx} (abs_chunk_idx={start_chunk_idx + local_idx})"
+                     break
++        logger.debug(
++            "request-logging offload-verbose: %s group %d "
++            "_maximal_prefix_lookup start_chunk_idx=%d scanned=%d hit_count=%d "
++            "defer_lookup=%s stop_reason=%s",
++            req.request_id,
++            group_config.group_idx,
++            start_chunk_idx,
++            total_keys,
++            hit_count,
++            defer_lookup,
++            stop_reason,
++        )
+         return hit_count if not defer_lookup else None
+ 
+     def _sliding_window_lookup(
+@@ -644,7 +660,10 @@
+         any_uncertain = False
+         consecutive_hits = 0
+         run_has_pending = False
++        result: int | None = None
++        scanned = 0
+         for idx in range(len(keys) - 1, -1, -1):
++            scanned += 1
+             match self.manager.lookup(keys[idx], req_context):
+                 case LookupResult.HIT:
+                     consecutive_hits += 1
+@@ -668,8 +687,24 @@
+                     consecutive_hits = 0
+                     run_has_pending = False
+             if consecutive_hits == sliding_window_size:
+-                return None if run_has_pending else idx + sliding_window_size
+-        return consecutive_hits if not any_uncertain else None
++                result = None if run_has_pending else idx + sliding_window_size
++                break
++        else:
++            result = consecutive_hits if not any_uncertain else None
++        logger.debug(
++            "request-logging offload-verbose: %s _sliding_window_lookup "
++            "len(keys)=%d sliding_window_size=%d scanned=%d "
++            "consecutive_hits=%d any_uncertain=%s run_has_pending=%s result=%s",
++            req_context.req_id,
++            len(keys),
++            sliding_window_size,
++            scanned,
++            consecutive_hits,
++            any_uncertain,
++            run_has_pending,
++            result,
++        )
++        return result
+ 
+     def _touch(self, req_status: RequestOffloadState):
+         for group_config, group_state in zip(
+@@ -874,6 +909,12 @@
+             offloading_context=offloading_context,
+         )
+         self._req_status[request.request_id] = req_status
++        logger.debug(
++            "request-logging offload-verbose: on_new_request %s -- "
++            "req_status registered (num_prompt_tokens=%d)",
++            request.request_id,
++            request.num_prompt_tokens,
++        )
+ 
+     def get_num_new_matched_tokens(
+         self, request: Request, num_computed_tokens: int
+@@ -1094,6 +1135,12 @@
+         ):
+             req_status = self._req_status.get(req_id)
+             if req_status is None:
++                logger.debug(
++                    "request-logging offload-verbose: _build_store_jobs SKIP %s "
++                    "-- no req_status tracked (never registered, or already "
++                    "cleaned up)",
++                    req_id,
++                )
+                 continue
+             req = req_status.req
+ 
+@@ -1109,6 +1156,17 @@
+                 req_status, num_tokens_after_batch
+             )
+ 
++            logger.debug(
++                "request-logging offload-verbose: _build_store_jobs %s "
++                "status=%s num_tokens_after_batch=%d num_offloadable_tokens=%d "
++                "max_offload_tokens=%s",
++                req_id,
++                req.status,
++                num_tokens_after_batch,
++                num_offloadable_tokens,
++                req_status.max_offload_tokens,
++            )
++
+             # Filter out chunks skipped due to sliding window attention / SSM
+             # or unreachable by the load path's alignment constraints.
+             new_offload_keys: list[OffloadKey] = []
+@@ -1121,6 +1179,17 @@
+ 
+                 start_chunk_idx = group_state.next_stored_chunk_idx
+                 if num_chunks <= start_chunk_idx:
++                    logger.debug(
++                        "request-logging offload-verbose: %s group %d SKIP "
++                        "num_chunks=%d <= start_chunk_idx=%d "
++                        "(num_allocated_chunks=%d, len(block_ids)=%d)",
++                        req_id,
++                        group_config.group_idx,
++                        num_chunks,
++                        start_chunk_idx,
++                        len(group_state.block_ids) // self.config.blocks_per_chunk,
++                        len(group_state.block_ids),
++                    )
+                     continue
+                 offload_keys = group_state.offload_keys[start_chunk_idx:num_chunks]
+                 # For each chunk, take the last corresponding GPU block. For
+@@ -1157,6 +1226,11 @@
+                     new_offload_keys.append(offload_key)
+ 
+             if not new_offload_keys:
++                logger.debug(
++                    "request-logging offload-verbose: %s NO STORE JOB -- "
++                    "new_offload_keys empty (every group skipped above)",
++                    req_id,
++                )
+                 req_status.advance_stored_idx(num_offloadable_tokens)
+                 continue
+ 
+@@ -1167,10 +1241,24 @@
+                 self._connector_stats.increase_counter(
+                     _ConnectorMetricName.ALLOCATION_FAILURE
+                 )
+-                logger.warning("Request %s: cannot store chunks", req_id)
++                logger.warning(
++                    "Request %s: cannot store chunks (prepare_store returned "
++                    "None -- primary tier allocation failure, e.g. CPU tier "
++                    "full/fragmented; %d chunks dropped)",
++                    req_id,
++                    len(new_offload_keys),
++                )
+                 continue
+ 
+             if not store_output.keys_to_store:
++                logger.debug(
++                    "request-logging offload-verbose: %s NO STORE JOB -- "
++                    "prepare_store returned %d keys but keys_to_store is empty "
++                    "(all %d already stored or in flight)",
++                    req_id,
++                    len(new_offload_keys),
++                    len(new_offload_keys),
++                )
+                 req_status.advance_stored_idx(num_offloadable_tokens)
+                 continue
+ 
+@@ -1274,6 +1362,13 @@
+                 num_offloadable_tokens,
+                 job_id,
+             )
++            logger.debug(
++                "request-logging offload-verbose: %s STORE_JOB_BLOCKS job=%d "
++                "src_block_ids=%s",
++                req_id,
++                job_id,
++                src_block_ids,
++            )
+ 
+         return store_jobs
+ 
+@@ -1310,6 +1405,36 @@
+             self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
+ 
+         # Flush jobs that contain re-allocated blocks.
++        if self._current_batch_allocated_block_ids:
++            protected_bids = [
++                bid
++                for bid in self._current_batch_allocated_block_ids
++                if bid in self._block_id_to_pending_jobs
++            ]
++            unprotected_bids = [
++                bid
++                for bid in self._current_batch_allocated_block_ids
++                if bid not in self._block_id_to_pending_jobs
++            ]
++            if protected_bids:
++                logger.debug(
++                    "request-logging offload-verbose: FLUSH %d block(s) being "
++                    "reallocated this step have a pending store job -- forcing "
++                    "it to complete first: blocks=%s",
++                    len(protected_bids),
++                    protected_bids,
++                )
++            if unprotected_bids:
++                logger.debug(
++                    "request-logging offload-verbose: REALLOC %d block(s) "
++                    "being reallocated this step with NO pending store job "
++                    "registered (either never had content, already-completed "
++                    "store, or genuinely unprotected -- cross-reference "
++                    "against 'EVICT block_id=' in block_pool.py's log to tell "
++                    "which): blocks=%s",
++                    len(unprotected_bids),
++                    unprotected_bids,
++                )
+         if (
+             self._block_id_to_pending_jobs
+             and not self._block_id_to_pending_jobs.keys().isdisjoint(
+@@ -1467,6 +1592,14 @@
+         if req_status is None:
+             # Untracked request (offloading never started): no in-flight jobs,
+             # nothing was deferred, so finalize immediately.
++            logger.debug(
++                "request-logging offload-verbose: request_finished %s -- "
++                "UNTRACKED (no req_status; on_new_request never registered "
++                "it, or it was already cleaned up) num_computed_tokens=%d "
++                "-- this content will NEVER be offloaded",
++                request.request_id,
++                request.num_computed_tokens,
++            )
+             req_context = _create_req_context(request)
+             self.manager.on_new_request(req_context)
+             self.manager.on_request_finished(req_context)
+@@ -1478,6 +1611,15 @@
+         # create store jobs for the last block(s) on the next schedule step.
+         req_status.update_offload_keys()
+ 
++        logger.debug(
++            "request-logging offload-verbose: request_finished %s -- "
++            "req_status present, %d transfer_jobs still pending at finish "
++            "time (these get retroactively registered for flush protection "
++            "below; if 0, everything already completed or was never queued)",
++            request.request_id,
++            len(req_status.transfer_jobs),
++        )
++
+         # Keep req_status alive: _build_store_jobs will process finished_req_ids
+         # on the next step and handle cleanup after creating store jobs.
+         #
+--- a/v1/core/block_pool.py
++++ b/v1/core/block_pool.py
+@@ -696,6 +696,17 @@
+             # The block doesn't have hash, eviction is not needed
+             return False
+ 
++        logger.debug(
++            "request-logging offload-verbose: EVICT block_id=%d ref_cnt=%d "
++            "evicted_hashes=%s -- this block held real, previously-cached "
++            "content and is about to be physically reused; cross-reference "
++            "against 'REALLOC'/'FLUSH' in offloading/scheduler.py's log for "
++            "the same block_id at the same timestamp to see whether this "
++            "reuse was protected by a pending store job.",
++            block.block_id,
++            block.ref_cnt,
++            evicted_hashes,
++        )
+         self._emit_block_removed_events(evicted_hashes)
+         return True
+ 
