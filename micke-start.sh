@@ -11,7 +11,7 @@ VLLM_OFFLOAD_EAGLE_FALLBACK=0 \
 VISION=1 \
 VLLM_VISION_CPU_OFFLOAD_GB=${VLLM_VISION_CPU_OFFLOAD_GB:-0} \
 VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file.json \
-EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --long-prefill-token-threshold 832 --limit-mm-per-prompt {"image":{"count":2,"width":1280,"height":1280},"video":0} --mm-processor-cache-gb 2 --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv","max_disk_gib":200}]}} --enable-cumem-allocator' \
+EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --long-prefill-token-threshold 832 --limit-mm-per-prompt {"image":{"count":2,"width":1024,"height":1024},"video":0} --mm-processor-kwargs {"max_pixels":1048576} --mm-processor-cache-gb 2 --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv","max_disk_gib":200}]}} --enable-cumem-allocator' \
 bash single-user/start_qwen.sh
 # PYTHONHASHSEED=0 -- fixes the KV-block hash chain's seed (NONE_HASH in
 # vllm/v1/core/kv_cache_utils.py) to a constant instead of os.urandom(32),
@@ -82,13 +82,24 @@ bash single-user/start_qwen.sh
 # multi-conversation load and consider MAX_SEQS=6 if they appear. VISION=0 gets
 # the whole pool back (tower not instantiated at all).
 #
-#   --limit-mm-per-prompt {"image":{"count":2,"width":1280,"height":1280},"video":0}
-# NOT optional. The default is 999 items per modality, and startup memory
-# profiling reserves the worst-case activation peak for that -- which would eat
-# the KV pool. count/width/height bound both the profiling reservation and the
-# per-image vision-token count (1280x1280 at patch_size 16 with spatial_merge 2
-# => ~1600 vision tokens). Raise deliberately, and re-check the resulting
-# "GPU KV cache size" log line if you do.
+#   --limit-mm-per-prompt {"image":{"count":2,"width":1024,"height":1024},"video":0}
+#   --mm-processor-kwargs {"max_pixels":1048576}
+# BOTH are required, and they MUST agree -- this pair caused an OOM crash on
+# 2026-08-23 when only the first was set.
+#   --limit-mm-per-prompt bounds the *startup memory profiling* dummy input
+# (its default of 999 items/modality would otherwise reserve an absurd
+# activation peak and eat the KV pool). It does NOT resize real inputs.
+#   --mm-processor-kwargs max_pixels is what actually caps a real incoming
+# image, by lowering the HF image processor's size.longest_edge (a total PIXEL
+# COUNT, confusingly named; the checkpoint ships 16,777,216 = 4096x4096).
+# Vision tokens = pixels / patch_size^2 / merge_size^2 = pixels / 1024 here,
+# so 1,048,576 px => ~1024 tokens/image, and count:2 caps a request at ~2048.
+#   Set only the first and you tell vLLM "profile for a small image" while
+# letting arbitrarily large ones through: a 3520x2496 screenshot arrived as
+# 8,580 vision tokens against a pool profiled for ~1600 and the ViT forward
+# died with `torch.OutOfMemoryError ... 11.94 MiB is free` (grid_thw
+# [1,220,156] in the dump_input trace). Keep the two consistent when changing
+# either, and re-check the "GPU KV cache size" log line afterwards.
 #
 #   --mm-processor-cache-gb 2
 # The default is 4 GiB and it is duplicated per API-server and engine-core
