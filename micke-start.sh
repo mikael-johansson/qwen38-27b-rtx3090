@@ -7,6 +7,7 @@ PREFIX_CACHE=1 \
 CTX=long \
 MAX_LEN=140000 \
 PYTHONHASHSEED=0 \
+VLLM_OFFLOAD_EAGLE_FALLBACK=0 \
 VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file-debug.json \
 EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --long-prefill-token-threshold 512 --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv","max_disk_gib":200}]}} --enable-cumem-allocator' \
 bash single-user/start_qwen.sh
@@ -46,6 +47,24 @@ bash single-user/start_qwen.sh
 # specific requests (e.g. short agentic deltas) to jump the waiting queue
 # ahead of a big prefill rather than just interleaving with it. Note it
 # does NOT bypass the --max-num-seqs=8 admission-slot cap either way.
+# VLLM_OFFLOAD_EAGLE_FALLBACK=0 -- disables the offload connector's
+# "mark every KV group as an EAGLE/MTP draft group" fallback
+# (patches/offload-eagle-misclassification-mamba.patch adds this knob;
+# default 1 keeps upstream behavior). This model's MTP drafter has one
+# attention layer (mtp.layers.0.self_attn.attn) sharing the full-attention
+# KV group, so the fallback marks that group as draft-volatile: its lookup
+# pops one provisional trailing chunk, and its newest complete chunk is
+# excluded from storing during decode. On turn N+1 of a conversation whose
+# shared prefix is still GPU-resident the external hit beyond the local
+# boundary is typically exactly that 1 popped chunk, so the external hit
+# collapses to 0 and the scheduler's HIT_DIVERGED reconcile throws away a
+# 30-50K-token GPU-resident prefix for a full reprefill (traced 2026-08-23,
+# two events in qwen.log.evidence-mamba-free-never-fired.log; 29 events /
+# 825K tokens discarded in one 20-min 3-way run). Worst case of trusting
+# the trailing chunk is a briefly-stale draft-layer KV near a resume
+# boundary => slightly lower spec-decode acceptance there; MTP drafts are
+# always verified by the target model, so output correctness is unaffected.
+# See RESULTS-hit-diverged.md (2026-08-23) for the measured comparison.
 # max_disk_gib:200 on the fs secondary tier -- patches/fs-tier-disk-cap.patch
 # adds this parameter to vLLM's FileSystemTierManager (no upstream equivalent
 # exists in 0.27.1, unlike the primary CPU tier's cpu_bytes_to_use). A

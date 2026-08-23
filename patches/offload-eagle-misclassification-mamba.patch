@@ -1,5 +1,9 @@
 Fix: KV-offloading connector misclassifies Mamba/GDN groups as EAGLE/MTP
-draft-model groups, permanently breaking their external-cache lookup.
+draft-model groups, permanently breaking their external-cache lookup; and
+(2026-08-23 revision) the same fallback's marking of the full-attention
+group amplifies an 832-token conservatism into 30-50K-token prefill
+recomputes (HIT_DIVERGED RECONCILE), so a deployment opt-out env var
+VLLM_OFFLOAD_EAGLE_FALLBACK is added.
 
 Full investigation: docs/mamba-align-prefill-leak.md ("The fix breaks KV
 offloading" -> "Root cause found and fixed"). Fast, reliable repro:
@@ -56,38 +60,148 @@ stress test (360K tokens of combined demand against a ~172K-token pool)
 completes with zero preemptions, zero discarded/never-offloaded KV cache,
 and peak GPU-KV usage of only 72.4%.
 
+CHANGELOG 2026-08-23 (regenerated; supersedes the 2026-08-22 version):
+
+New evidence: both HIT_DIVERGED RECONCILE events captured in
+qwen.log.evidence-mamba-free-never-fired.log (lines ~5102-5109 and
+~27848-27855) show the offload tier could fully back a resume at the deep
+local attention boundary -- every mamba group returned a confirmed HIT at
+the boundary chunk, and the attention group externally hit exactly 1 chunk
+beyond it (then `exhausted`: the remaining chunks are the genuinely new
+user message). Yet the connector reported ext=0 and the scheduler's
+reconcile discarded 39,936 tokens of GPU-resident hit. Mechanism: group 3
+(full attention) is still marked eagle by the fallback (only MambaSpec
+groups were excluded in the 2026-08-22 version), and in _lookup() an
+eagle group pops one provisional trailing chunk after a successful lookup
+(num_hit_chunks -= 1). The attention group's external hit was exactly 1
+chunk -> popped to 0 -> max_hit_size_tokens collapses to the local
+boundary -> `return 0` -> HIT_DIVERGED RECONCILE fires. This fires on
+precisely the production pattern (turn N+1 of a conversation whose shared
+prefix is mostly GPU-resident: the external hit beyond the local boundary
+is almost always the previous turn's 1-2 decode-tail chunks). Secondary
+store-side effect of the same marking: storable_chunks() excludes the
+newest complete chunk of an eagle group from storing during decode, so
+each finished turn's final complete attention chunk is never stored --
+weakening exactly the chunk the next turn needs.
+
+Group composition was verified at runtime (2026-08-23, startup dump added
+by this patch): group 3 layer_names = the 16 target full-attention layers
+PLUS mtp.layers.0.self_attn.attn -- the MTP drafter's attention KV really
+does live in group 3 (Case A2 of HIT_DIVERGED_FIX_PLAN.md). The eagle
+guard is therefore not a pure false positive here, and disabling it is a
+deliberate tradeoff: a trailing chunk whose draft-layer KV was rewritten
+after spec-token rejection may be restored stale, which can only lower
+the spec-decode acceptance rate briefly near a resume boundary -- MTP
+drafts are always verified by the target model, so output correctness is
+unaffected. Measured acceptance-rate comparison: RESULTS-hit-diverged.md.
+
+What the revision adds:
+  - VLLM_OFFLOAD_EAGLE_FALLBACK env var (read directly via os.environ in
+    from_spec(); default "1" = unchanged upstream-ish behavior, i.e. the
+    mark-everything fallback minus MambaSpec groups). Set to "0"
+    (micke-start.sh does) the fallback is disabled entirely: no group is
+    treated as draft-volatile, group 3's lookup no longer pops its
+    trailing chunk, and its newest complete chunk is stored during
+    decode like any other. A distinct INFO line ("EAGLE/MTP
+    mark-everything fallback disabled via VLLM_OFFLOAD_EAGLE_FALLBACK=0")
+    replaces the "EAGLE/MTP draft attention groups [3] detected" line --
+    that's the smoke-test signal that the fix is active.
+  - Startup INFO dump of every KV cache group's spec class + layer_names
+    (the instrument that established Case A2; kept, it's 4 lines once per
+    boot).
+
+Verified (2026-08-23): startup log shows the fallback-disabled line and
+no "EAGLE/MTP draft attention groups" line; test_offload_regression.sh
+passes (conv A turn 2 served from offload tier); needle-recall check
+(unique 6-digit code deep in a long prompt, recalled exactly at
+temperature 0 on a turn resuming from offloaded state) passes. See
+RESULTS-hit-diverged.md for the full measurement matrix.
+
 --- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
 +++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
-@@ -216,7 +216,31 @@
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import time
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field
+@@ -205,6 +206,20 @@
+                 return None
+             return per_segment
+ 
++        # Dump the group -> layer_names mapping once at startup so
++        # draft-model-layer membership per group is verifiable from the log
++        # (used to establish that this model's MTP drafter attention layer,
++        # mtp.layers.0.self_attn.attn, shares the full-attention group --
++        # see the patch header and RESULTS-hit-diverged.md, 2026-08-23).
++        for idx, g in enumerate(kv_cache_config.kv_cache_groups):
++            logger.info(
++                "request-logging offload-verbose: KV cache group %d "
++                "spec=%s layer_names=%s",
++                idx,
++                type(g.kv_cache_spec).__name__,
++                g.layer_names,
++            )
++
+         eagle_groups = {
+             idx
+             for idx, g in enumerate(kv_cache_config.kv_cache_groups)
+@@ -216,7 +231,56 @@
              and vllm_config.speculative_config.use_eagle()
          )
          if use_eagle and not eagle_groups:
 -            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
-+            # Fallback for architectures where the draft model's KV cache
-+            # groups aren't explicitly tagged is_eagle_group: assume every
-+            # group might hold volatile draft-model state and require an
-+            # extra trailing chunk before trusting a sliding-window hit.
-+            # This is wrong for Mamba/GDN recurrent-state groups: they are
-+            # the *main* model's own state (this repo's MTP draft head has
-+            # no mamba layers -- see single_type_kv_cache_manager.py's own
-+            # allocate_new_blocks() comment on this), never a
-+            # draft-model's, so there's no volatile trailing chunk to guard
-+            # against. Applying the +1-chunk eagle window there instead
-+            # permanently breaks their offload lookup: align-mode Mamba
-+            # groups use a 1-chunk sliding window (get_sliding_window_size_
-+            # in_chunks() above), and the eagle fallback bumps that to a
-+            # 2-consecutive-chunk requirement that the data can structurally
-+            # never satisfy (confirmed via test_offload_regression.sh: full
-+            # miss, every time, at any batch size -- see
-+            # docs/mamba-align-prefill-leak.md). Excluding Mamba groups
-+            # here fixes it.
-+            eagle_groups = {
-+                idx
-+                for idx in range(len(kv_cache_config.kv_cache_groups))
-+                if not isinstance(
-+                    kv_cache_config.kv_cache_groups[idx].kv_cache_spec, MambaSpec
++            if os.environ.get("VLLM_OFFLOAD_EAGLE_FALLBACK", "1") == "0":
++                # Deployment opt-out of the mark-everything fallback below.
++                # For this repo's Qwen3.8-27B MTP config the fallback marks
++                # the full-attention group (which the MTP drafter's single
++                # attention layer shares) as an eagle group, and that
++                # conservatism is catastrophically amplified: on turn N+1 of
++                # a conversation whose shared prefix is still GPU-resident,
++                # the external hit beyond the local boundary is typically
++                # exactly 1 chunk (the previous turn's decode tail), the
++                # eagle lookup pops that one provisional chunk to 0, ext
++                # collapses to 0, and the scheduler's HIT_DIVERGED reconcile
++                # then discards a 30-50K-token GPU-resident hit for a full
++                # reprefill (traced 2026-08-23, see patch header). The worst
++                # case of trusting the trailing chunk is a briefly stale
++                # draft-layer KV near a resume boundary, which can only
++                # lower spec-decode acceptance rate -- MTP drafts are always
++                # verified by the target model, so output correctness is
++                # unaffected. That trade is deliberately taken here.
++                logger.info(
++                    "KV offloading: EAGLE/MTP mark-everything fallback "
++                    "disabled via VLLM_OFFLOAD_EAGLE_FALLBACK=0; no KV "
++                    "cache groups are treated as draft-volatile."
 +                )
-+            }
++            else:
++                # Fallback for architectures where the draft model's KV cache
++                # groups aren't explicitly tagged is_eagle_group: assume every
++                # group might hold volatile draft-model state and require an
++                # extra trailing chunk before trusting a sliding-window hit.
++                # This is wrong for Mamba/GDN recurrent-state groups: they are
++                # the *main* model's own state (this repo's MTP draft head has
++                # no mamba layers -- see single_type_kv_cache_manager.py's own
++                # allocate_new_blocks() comment on this), never a
++                # draft-model's, so there's no volatile trailing chunk to guard
++                # against. Applying the +1-chunk eagle window there instead
++                # permanently breaks their offload lookup: align-mode Mamba
++                # groups use a 1-chunk sliding window (get_sliding_window_size_
++                # in_chunks() above), and the eagle fallback bumps that to a
++                # 2-consecutive-chunk requirement that the data can structurally
++                # never satisfy (confirmed via test_offload_regression.sh: full
++                # miss, every time, at any batch size -- see
++                # docs/mamba-align-prefill-leak.md). Excluding Mamba groups
++                # here fixes it.
++                eagle_groups = {
++                    idx
++                    for idx in range(len(kv_cache_config.kv_cache_groups))
++                    if not isinstance(
++                        kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
++                        MambaSpec,
++                    )
++                }
  
          if eagle_groups:
              logger.info(
