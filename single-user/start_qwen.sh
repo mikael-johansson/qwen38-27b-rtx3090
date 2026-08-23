@@ -265,27 +265,36 @@ LM_ONLY_ARG="--language-model-only"
 [ "${VISION:-0}" = "1" ] && LM_ONLY_ARG=""
 
 # MAMBA_SSM_DTYPE: dtype of the Mamba/GDN recurrent (SSM) state cache.
-# Changed float16 -> bfloat16 on 2026-08-23 to fix degenerate "!!!!!!" output.
+# Set to float32 on 2026-08-23 -- the value this model's own config.json
+# declares (mamba_ssm_dtype='float32'). BOTH 2-byte options corrupt output on
+# this model; measured, not theorised:
 #
-# Symptom: a request would emit thousands of "!" and never stop, at ~30 tok/s
-# instead of ~90. "!" is token id 0 -- i.e. argmax over a corrupted (NaN/inf)
-# logits tensor, not a semantic loop. Two tells confirmed it: the garbage
-# started at the FIRST token of the response rather than drifting into it, and
-# MTP speculative decoding sat at exactly 0.0% acceptance for the whole request
+#   float16   intermittent runs of "!" -- thousands of them, never stopping.
+#             "!" is token id 0, i.e. argmax over a NaN/inf logits tensor.
+#             Seen 13:19-14:03 on 2026-08-23. float16 tops out at 65,504 and a
+#             recurrent state accumulates along the sequence.
+#   bfloat16  WORSE, and immediately: multilingual token soup
+#             ("增悠悠venctime้ามersch Toc_MetaDataEnum...") on a trivial
+#             text-only "Hello?" prompt, first try, 14:19. bfloat16 has
+#             float32's exponent range but only a 7-bit mantissa (vs float16's
+#             10). Trading precision for range is the wrong trade here: the
+#             SSM state accumulates many small updates, so mantissa bits are
+#             what it actually needs. Do not use.
+#   float32   what the model asks for. Costs double the SSM state (smaller KV
+#             pool) and throughput (per docs/quality.md, 516 vs 707 tok/s in
+#             batch mode) -- pay it.
+#
+# How the failure is recognised, for whoever hits this next: the garbage starts
+# at the FIRST token of the response rather than drifting into it, and MTP
+# speculative decoding sits at exactly 0.0% acceptance for the whole request
 # (mean acceptance length 1.00, per-position 0.000/0.000/0.000, vs ~2.95 and
-# 65% normally) -- a drafter can never match NaN logits. The ~3x slowdown was
-# purely the lost speculation, not the cause.
-#
-# Why the dtype: this model's config.json declares mamba_ssm_dtype='float32'
-# and vLLM warns on every start that we are overriding it. float16 tops out at
-# 65,504; a recurrent state accumulates along the sequence, and once it exceeds
-# that it goes inf -> NaN and every subsequent token is 0. bfloat16 is the same
-# 2 bytes as float16 (so no memory or throughput cost -- the KV pool is
-# unchanged) but carries float32's exponent range (3.39e38), which removes the
-# overflow. It buys that with a coarser mantissa (7 bits vs 10), so if long
-# sequences start drifting in quality, step up to float32 -- what the model
-# actually asks for -- at the cost of double the SSM state and, per
-# docs/quality.md, throughput (516 vs 707 tok/s in batch mode).
+# ~65% healthy) -- a drafter can never match corrupted logits. The ~3x
+# slowdown that comes with it (30 vs 90 tok/s) is purely the lost speculation,
+# a symptom rather than the cause. Detect with:
+#     grep -c '!!!!!!!!' requests/*.log
+#     grep SpecDecoding qwen.log | tail -3
+# and note the garbage often lands in reasoning_content while `content` comes
+# back empty -- checking only `content` will make a reproduction look clean.
 #
 # NOT caused by this repo's 2026-08-22/23 offload/vision work: independently
 # reported at syv-ai/qwen38-27b-rtx3090 issue #8 with the same "!!!!!!" loops,
@@ -309,7 +318,7 @@ exec venv/bin/vllm serve "$MODEL" \
   --api-server-count $API_SERVERS \
   $LM_ONLY_ARG \
   $ATTN_ARGS \
-  --mamba-ssm-cache-dtype ${MAMBA_SSM_DTYPE:-bfloat16} \
+  --mamba-ssm-cache-dtype ${MAMBA_SSM_DTYPE:-float32} \
   ${ASYNC_ARGS} \
   --max-num-batched-tokens 2048 \
   --speculative-config "$SPEC_CFG" \
