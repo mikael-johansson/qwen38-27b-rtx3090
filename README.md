@@ -263,6 +263,7 @@ perplexity / GSM8K rows.
 | [docs/optimizations.md](docs/optimizations.md) | Every optimization in full: why it was needed, what it measured, which patch implements it. Includes the two speculative-decoding modes (MTP and DFlash2) and the lookup drafter. |
 | [docs/gotchas.md](docs/gotchas.md) | 18 things that each cost us hours — read before debugging something that looks like a vLLM bug. |
 | [docs/quality.md](docs/quality.md) | IFBench, perplexity and GSM8K per configuration. |
+| [docs/vllm-git.md](docs/vllm-git.md) | The installed vLLM is also a git repo, so states can be stepped through with `checkout`/`bisect` instead of hand-reversing patches. **Every edit must land both as a commit there and as a patch in `patches/`** — `verify.sh` fails if they drift. |
 | [docs/docker.md](docs/docker.md) | The container image, and an independent WSL2 reproduction. |
 | [docs/long-context.md](docs/long-context.md) | 262k context with the KVarN 4/2-bit KV cache, and what vLLM's own per-token-head KV modes are worth here. |
 | [docs/mamba-align-prefill-leak.md](docs/mamba-align-prefill-leak.md) | Root cause for large-prompt self-preemption in `mamba-cache-mode align`'s block freeing, plus a second upstream bug it exposed (KV-offloading connector misclassifying Mamba/GDN groups as EAGLE/MTP draft groups). **Both fixed 2026-08-22** and verified under concurrent load at the default `--max-num-batched-tokens 2048`. |

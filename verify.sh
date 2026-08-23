@@ -48,6 +48,25 @@ for p in patches/*.patch; do
 done
 grep -q "VLLM_MARLIN_INT8_INCLUDE_RE" "$SP/envs.py" 2>/dev/null && ok "int8 layer-select env vars registered in envs.py" || fail "envs.py lacks VLLM_MARLIN_INT8_INCLUDE_RE"
 
+# The installed vllm package is also a standalone git repo (see docs/vllm-git.md),
+# so states can be stepped through with checkout/bisect instead of hand-reversing
+# patch files. It is only useful if it stays in sync: every edit to $SP must end
+# up BOTH as a commit there and as a patch in patches/. A dirty tree means an
+# edit was made and never captured -- the next `pip install` or reverse-apply
+# would silently lose it.
+echo "== vLLM git tracking (venv/.../vllm/.git — see docs/vllm-git.md)"
+if [ -d "$SP/.git" ]; then
+  if [ -z "$(git -C "$SP" status --porcelain 2>/dev/null)" ]; then
+    ok "vllm git tree clean, at $(git -C "$SP" log -1 --format=%h\ %s 2>/dev/null | cut -c1-60)"
+  else
+    fail "vllm git tree DIRTY — uncommitted edits in $SP not captured in patches/ or a commit:"
+    git -C "$SP" status --porcelain 2>/dev/null | head -10 | sed 's/^/          /'
+    printf "          fix: regenerate the patch (git -C %s diff -- <file>), then commit there\n" "$SP"
+  fi
+else
+  warn "vllm is not git-tracked (docs/vllm-git.md explains the setup; a pip reinstall removes it)"
+fi
+
 echo "== KVarN (optional, kvarn/)"
 if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
   if patch -p1 -R --dry-run -s -d "$SP" < kvarn/kvarn-0.27.1.patch >/dev/null 2>&1; then
