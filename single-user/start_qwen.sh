@@ -264,6 +264,42 @@ fi
 LM_ONLY_ARG="--language-model-only"
 [ "${VISION:-0}" = "1" ] && LM_ONLY_ARG=""
 
+# MAMBA_SSM_DTYPE: dtype of the Mamba/GDN recurrent (SSM) state cache.
+# Changed float16 -> bfloat16 on 2026-08-23 to fix degenerate "!!!!!!" output.
+#
+# Symptom: a request would emit thousands of "!" and never stop, at ~30 tok/s
+# instead of ~90. "!" is token id 0 -- i.e. argmax over a corrupted (NaN/inf)
+# logits tensor, not a semantic loop. Two tells confirmed it: the garbage
+# started at the FIRST token of the response rather than drifting into it, and
+# MTP speculative decoding sat at exactly 0.0% acceptance for the whole request
+# (mean acceptance length 1.00, per-position 0.000/0.000/0.000, vs ~2.95 and
+# 65% normally) -- a drafter can never match NaN logits. The ~3x slowdown was
+# purely the lost speculation, not the cause.
+#
+# Why the dtype: this model's config.json declares mamba_ssm_dtype='float32'
+# and vLLM warns on every start that we are overriding it. float16 tops out at
+# 65,504; a recurrent state accumulates along the sequence, and once it exceeds
+# that it goes inf -> NaN and every subsequent token is 0. bfloat16 is the same
+# 2 bytes as float16 (so no memory or throughput cost -- the KV pool is
+# unchanged) but carries float32's exponent range (3.39e38), which removes the
+# overflow. It buys that with a coarser mantissa (7 bits vs 10), so if long
+# sequences start drifting in quality, step up to float32 -- what the model
+# actually asks for -- at the cost of double the SSM state and, per
+# docs/quality.md, throughput (516 vs 707 tok/s in batch mode).
+#
+# NOT caused by this repo's 2026-08-22/23 offload/vision work: independently
+# reported at syv-ai/qwen38-27b-rtx3090 issue #8 with the same "!!!!!!" loops,
+# the same --mamba-ssm-cache-dtype float16 + prefix caching + MTP + qwen3
+# reasoning parser, but a *different* KV cache dtype (kvarn_k4v2_g128 vs our
+# fp8) -- which rules out fp8 KV and leaves the fp16 SSM state as the shared
+# factor. Images make it more frequent (ViT embeddings have different
+# magnitudes than text) but that report predates vision entirely.
+#
+# Override to compare: MAMBA_SSM_DTYPE=float16 bash micke-start.sh
+# Note --enable-mamba-cache-stochastic-rounding REQUIRES float16, so it is
+# incompatible with this default; vLLM shipping that flag at all is itself a
+# sign that fp16 SSM state is numerically delicate.
+
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
   --host 0.0.0.0 --port $PORT \
@@ -273,7 +309,7 @@ exec venv/bin/vllm serve "$MODEL" \
   --api-server-count $API_SERVERS \
   $LM_ONLY_ARG \
   $ATTN_ARGS \
-  --mamba-ssm-cache-dtype float16 \
+  --mamba-ssm-cache-dtype ${MAMBA_SSM_DTYPE:-bfloat16} \
   ${ASYNC_ARGS} \
   --max-num-batched-tokens 2048 \
   --speculative-config "$SPEC_CFG" \
