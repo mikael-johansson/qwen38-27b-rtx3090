@@ -226,6 +226,17 @@ if [ -n "$REQUEST_LOG_DIR" ]; then
   export REQUEST_LOG_DIR
 fi
 
+# VISION=1 loads the model's vision tower (Qwen3.5 is a VL model and the
+# quantized checkpoint ships all 333 visual tensors, 879 MiB BF16 -- they are
+# excluded from the W4A16 quant). Default stays text-only: --language-model-only
+# sets limit_mm_per_prompt=0 for every modality, which makes vLLM's
+# _mark_tower_model skip *instantiating* the tower, so it costs no VRAM at all.
+# With VISION=1 the caller is expected to also pass, via EXTRA_ARGS, at minimum
+# a --limit-mm-per-prompt (the 999-per-modality default makes startup memory
+# profiling reserve an absurd activation peak) -- see micke-start.sh.
+LM_ONLY_ARG="--language-model-only"
+[ "${VISION:-0}" = "1" ] && LM_ONLY_ARG=""
+
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
   --host 0.0.0.0 --port $PORT \
@@ -233,7 +244,7 @@ exec venv/bin/vllm serve "$MODEL" \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count $API_SERVERS \
-  --language-model-only \
+  $LM_ONLY_ARG \
   $ATTN_ARGS \
   --mamba-ssm-cache-dtype float16 \
   ${ASYNC_ARGS} \
