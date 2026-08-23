@@ -153,12 +153,39 @@ if [ "$SPEC" = "dflash2" ]; then
   MAX_SEQS=${MAX_SEQS:-8}
   # The V2 model runner captures decode graphs in multiples of k+1 tokens: cover MAX_SEQS requests.
   CG=${CG:-$((MAX_SEQS * (DRAFT_TOKENS + 1)))}
-  [ -n "$KV_MEM" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
 else
   MAX_SEQS=${MAX_SEQS:-8}
   SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
   CG=${CG:-32}
 fi
+
+# KV_MEM pins the KV pool in bytes (--kv-cache-memory) instead of letting it fall
+# out of --gpu-memory-utilization. Applies to BOTH spec-decode modes: the dflash2
+# branch above sets a default (its V2 runner's profiled activation peak swings
+# ~1 GiB between starts of the same config), and MTP mode leaves it empty ->
+# utilization-based, unchanged -- but can opt in.
+#
+# Why you might want it in MTP mode: the startup activation profile is not
+# deterministic, so an unlucky start silently gives you a smaller pool than a
+# lucky one for byte-identical config. Measured on this box, text-only:
+# 5.2 GiB on two starts vs 6.11 GiB on a third -- ~0.9 GiB / 33 blocks / ~26k
+# tokens of pool lost, invisibly. Pinning makes every start behave like the
+# good one.
+#
+# DANGER, read docs/gotchas.md #4 before setting this. Pinning does NOT create
+# memory: whatever you pin above what a given start would have profiled comes
+# out of the transient/activation headroom, and with MTP the DeltaNet/GDN
+# speculative path allocates workspace that startup profiling does NOT measure.
+# The failure mode is that the engine dies mid-request on long generations while
+# surviving short benchmarks. So:
+#   * pin at or below the best value you have actually observed for YOUR exact
+#     config (grep 'Available KV cache memory' in qwen.log across restarts --
+#     it changes with vision on/off, spec mode, MAX_LEN, etc.), and
+#   * soak-test it with long generations at real concurrency before trusting it.
+# As of 2026-08-23 this config (vision tower resident in VRAM) profiled 5.17 GiB
+# on 3/3 starts -- i.e. no exploitable variance observed yet, which is why the
+# default stays empty. Example: KV_MEM=5553063854 bash micke-start.sh   # 5.17 GiB
+[ -n "$KV_MEM" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
 
 # PREFIX_CACHE=1: reuse the KV of a shared prompt prefix across requests, and resume the
 # recurrent (GDN) state from the last cached block boundary instead of re-running the prompt.

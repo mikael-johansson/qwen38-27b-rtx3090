@@ -1,0 +1,192 @@
+Make it possible to CPU-offload a Qwen3-VL vision tower's transformer blocks
+to pinned host RAM (UVA zero-copy), which stock vLLM 0.27.1 cannot do.
+
+MEASURED VERDICT (2026-08-23, this box): it works and recovers 0.78 GiB of KV
+pool, but costs 2.6-3.8x on image-encode latency. Default is OFF (0). Turn it
+on only if GPU KV blocks are worth more to you than image latency -- see the
+numbers at the bottom before deciding.
+
+Why stock vLLM can't do this: --cpu-offload-gb / --cpu-offload-params are
+accepted without error but are a silent NO-OP for vision towers. The
+offloader's only call site in the entire codebase is
+`get_offloader().wrap_modules(...)` inside make_layers()
+(model_executor/models/utils.py), and make_layers() builds the *language
+model* decoder stack only (qwen3_5.py's Qwen3_5Model). The vision tower builds
+its blocks with a plain `nn.ModuleList` (qwen3_vl.py's
+Qwen3_VisionTransformer), so the offloader never sees them. Symptom: no
+"Total CPU offloaded parameters" line is logged and the KV pool shrinks by the
+full weight of the tower. Confirmed by grep: `wrap_modules` appears at exactly
+one call site.
+
+Note the *filter* would have worked -- "visual" is segment-exact (the matcher
+is `f".{param}." in f".{name}."`) and matches exactly the 333 model.visual.*
+tensors and zero language-model tensors on this checkpoint. It is only the
+call-site coverage that is missing.
+
+What this patch adds:
+
+  VLLM_VISION_CPU_OFFLOAD_GB (float, default 0 = off, upstream behavior)
+
+When > 0, Qwen3_VisionTransformer routes its blocks through a *dedicated*
+UVAOffloader instance with that byte budget. A dedicated instance rather than
+the global one, so this budget can neither be consumed by nor steal budget
+from language-model layers: cpu_offload_params is left empty (= "offload
+everything handed to me") and the only modules handed over are the ViT blocks.
+
+Mechanically (vllm/model_executor/offloader/uva.py): each parameter is copied
+to pinned host memory and replaced by `get_accelerator_view_from_cpu_tensor()`
+-- a CUDA-addressable view of that host memory. The weights are never resident
+in VRAM and are never staged in; CUDA kernels read them across PCIe during the
+forward. Compute stays on the GPU; the CPU never runs the ViT. Weight loading
+still works because wrapping happens at construction time, before load_weights
+writes into the params -- the same ordering make_layers() already relies on.
+
+Only the 27 transformer blocks are offloaded (0.77 of the tower's 0.86 GiB).
+patch_embed, pos_embed, merger and deepstack_merger_list stay in VRAM: they are
+small and, unlike the blocks, are not a clean repeating unit to hand to the
+offloader.
+
+Safe here because the ViT is neither torch.compile'd nor cudagraph'd in this
+deployment (compile_mm_encoder and cudagraph_mm_encoder are both False). Do not
+assume that holds if those are enabled.
+
+--------------------------------------------------------------------------
+MEASURED (bench/vision_offload_ab.py, 5 unique images per size so neither the
+mm-processor cache nor the prefix cache can serve a repeat; RTX 3090, PCIe 4.0
+x16, Qwen3.5-27B W4A16, MTP spec decode on):
+
+  KV pool         OFF: 5.17 GiB / 145,326 tok      ON: 5.95 GiB / 167,391 tok
+                  (+0.78 GiB, +22,065 tokens, ~+29 blocks of 832)
+
+  image     vis_tok    OFF (VRAM)   ON (UVA)    overhead
+    224px        85       0.193s      0.493s      2.6x
+    448px       217       0.456s      1.288s      2.8x
+    896px       805       0.923s      2.536s      2.7x
+   1280px      1621       1.335s      5.029s      3.8x
+
+Why the cost is so much larger than a naive "one pass over 0.77 GiB at PCIe
+bandwidth would be ~40 ms" estimate, and why it *scales with image size*
+instead of being constant: GEMM kernels tile. A weight tile is re-read once
+per row-block of the activation matrix, so a forward pass reads each weight
+many times, not once -- e.g. a 1280px image is ~6,484 patches pre-merge, so
+the (1152 x 3456) qkv weight is re-read on the order of 50x per layer. In VRAM
+(~936 GB/s) those re-reads are nearly free; across PCIe (~20 GB/s effective)
+they dominate. L2 (6 MB on a 3090) absorbs some but not most of it.
+
+The general lesson: UVA weight offloading suits memory-bound, low-arithmetic-
+intensity layers, not a compute-heavy ViT fed large activation matrices.
+
+Choosing a value:
+  - 0 (default): weights in VRAM. Fast images, ~29 fewer KV blocks.
+  - 1: whole block stack offloaded. Max KV pool, slowest images.
+  - Intermediate (e.g. 0.4): partial -- the offloader fills its budget
+    per-parameter and stops, so roughly half the blocks are offloaded and the
+    rest stay in VRAM. Untested here, but the mechanism supports it.
+Capping --limit-mm-per-prompt's width/height also directly bounds the worst
+case, since the overhead scales with patch count.
+
+--- a/envs.py
++++ b/envs.py
+@@ -190,6 +190,9 @@
+     # request-logging patch: mamba-align stale-checkpoint offload slack (see
+     # patches/mamba-align-stale-checkpoint-offload-slack.patch)
+     VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS: int = 0
++    # request-logging patch: CPU-offload the ViT tower (see
++    # patches/vision-tower-cpu-offload.patch)
++    VLLM_VISION_CPU_OFFLOAD_GB: float = 0
+     VLLM_DRAFT_TOPK_TOPP: bool = True
+     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+@@ -1496,6 +1499,15 @@
+     "VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS": lambda: int(
+         os.environ.get("VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS", "0")
+     ),
++    # request-logging patch: budget (GiB) for CPU-offloading the ViT tower's
++    # transformer blocks to pinned host RAM via UVA. 0 (default) = off,
++    # unchanged upstream behavior. Stock --cpu-offload-gb/--cpu-offload-params
++    # cannot reach a vision tower: the offloader's only call site is inside
++    # make_layers(), which builds the language-model decoder stack only. See
++    # patches/vision-tower-cpu-offload.patch.
++    "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
++        os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
++    ),
+     "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
+     # The activation dtype config for humming kernel
+     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
+--- a/model_executor/models/qwen3_vl.py
++++ b/model_executor/models/qwen3_vl.py
+@@ -56,6 +56,7 @@
+     VideoDummyOptions,
+     VideoPruningMethod,
+ )
++import vllm.envs as envs
+ from vllm.distributed import get_pp_group, parallel_state
+ from vllm.inputs import MultiModalDataDict
+ from vllm.logger import init_logger
+@@ -625,20 +626,52 @@
+             dtype=torch.get_default_dtype(),
+         )
+ 
+-        self.blocks = nn.ModuleList(
+-            [
+-                Qwen3_VisionBlock(
+-                    dim=self.hidden_size,
+-                    num_heads=self.num_heads,
+-                    mlp_hidden_dim=vision_config.intermediate_size,
+-                    act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
+-                    norm_layer=norm_layer,
+-                    quant_config=quant_config,
+-                    prefix=f"{prefix}.blocks.{layer_idx}",
+-                )
+-                for layer_idx in range(vision_config.depth)
+-            ]
+-        )
++        def _make_block(layer_idx: int) -> "Qwen3_VisionBlock":
++            return Qwen3_VisionBlock(
++                dim=self.hidden_size,
++                num_heads=self.num_heads,
++                mlp_hidden_dim=vision_config.intermediate_size,
++                act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
++                norm_layer=norm_layer,
++                quant_config=quant_config,
++                prefix=f"{prefix}.blocks.{layer_idx}",
++            )
++
++        # request-logging patch: optionally keep the ViT blocks' weights out of
++        # VRAM (see patches/vision-tower-cpu-offload.patch).
++        #
++        # Stock --cpu-offload-gb / --cpu-offload-params cannot reach a vision
++        # tower: the offloader's only call site in vLLM is
++        # get_offloader().wrap_modules() inside make_layers()
++        # (model_executor/models/utils.py), which builds the *language model*
++        # decoder stack. The tower's blocks are a plain nn.ModuleList, so the
++        # offloader never sees them and the flags are a silent no-op.
++        #
++        # A dedicated offloader instance is used rather than the global one so
++        # this budget cannot be consumed by (or steal budget from) language
++        # model layers: cpu_offload_params is left empty, which means "offload
++        # everything handed to me", and the only modules handed over are the
++        # ViT blocks.
++        vision_offload_gib = envs.VLLM_VISION_CPU_OFFLOAD_GB
++        if vision_offload_gib > 0:
++            from vllm.model_executor.offloader.uva import UVAOffloader
++
++            offloader = UVAOffloader(int(vision_offload_gib * (1024**3)))
++            blocks = offloader.wrap_modules(
++                _make_block(layer_idx) for layer_idx in range(vision_config.depth)
++            )
++            logger.info(
++                "Vision tower: CPU-offloading ViT blocks via UVA "
++                "(budget %.2f GiB, %d blocks). Weights live in pinned host RAM "
++                "and are read over PCIe during the forward pass; compute stays "
++                "on the GPU.",
++                vision_offload_gib,
++                len(blocks),
++            )
++        else:
++            blocks = [_make_block(layer_idx) for layer_idx in range(vision_config.depth)]
++
++        self.blocks = nn.ModuleList(blocks)
+ 
+     @property
+     def dtype(self) -> torch.dtype:

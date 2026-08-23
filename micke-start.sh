@@ -9,6 +9,7 @@ MAX_LEN=140000 \
 PYTHONHASHSEED=0 \
 VLLM_OFFLOAD_EAGLE_FALLBACK=0 \
 VISION=1 \
+VLLM_VISION_CPU_OFFLOAD_GB=${VLLM_VISION_CPU_OFFLOAD_GB:-0} \
 VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file.json \
 EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --long-prefill-token-threshold 832 --limit-mm-per-prompt {"image":{"count":2,"width":1280,"height":1280},"video":0} --mm-processor-cache-gb 2 --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv","max_disk_gib":200}]}} --enable-cumem-allocator' \
 bash single-user/start_qwen.sh
@@ -32,10 +33,28 @@ bash single-user/start_qwen.sh
 # vLLM's _mark_tower_model skip instantiating the tower entirely -- so it cost
 # no VRAM but images were simply unsupported.
 #
-# CPU-OFFLOADING THE VISION TOWER IS NOT POSSIBLE with stock vLLM 0.27.1 --
-# tried and removed on 2026-08-23. `--cpu-offload-gb 1 --cpu-offload-params
-# visual --offload-backend uva` looks like it should work and is accepted
-# without error, but it is a silent NO-OP for vision towers:
+#   VLLM_VISION_CPU_OFFLOAD_GB (patches/vision-tower-cpu-offload.patch)
+# Default 0 = ViT weights stay in VRAM. Set to 1 to move the 27 ViT blocks
+# (0.77 GiB) into pinned host RAM, read over PCIe via UVA -- compute still runs
+# on the GPU. MEASURED TRADE on this box (bench/vision_offload_ab.py):
+#     KV pool   0 -> 5.17 GiB / 145,326 tok      1 -> 5.95 GiB / 167,391 tok
+#     image encode latency: 2.6-3.8x SLOWER when offloaded
+#       224px 0.19->0.49s   448px 0.46->1.29s   896px 0.92->2.54s
+#       1280px 1.34->5.03s
+# Left OFF by default because a 2.6-3.8x hit on every image is very visible,
+# while the ~29 blocks it buys back matter only under heavy concurrency. Flip
+# to 1 (or a partial budget like 0.4) if KV blocks turn out to be worth more
+# than image latency for your traffic. The cost scales with patch count, so
+# lowering --limit-mm-per-prompt's width/height also bounds it.
+#   Why it is not just "one PCIe pass over 0.77 GiB (~40 ms)": GEMM kernels
+# tile, so each weight tile is re-read once per row-block of the activation
+# matrix -- many passes, not one. Cheap from VRAM (~936 GB/s), dominant across
+# PCIe (~20 GB/s). UVA offload suits memory-bound layers, not a compute-heavy
+# ViT. Full write-up in the patch header.
+#
+# NOTE the stock flags cannot do this. `--cpu-offload-gb 1 --cpu-offload-params
+# visual --offload-backend uva` is accepted without error but is a silent NO-OP
+# for vision towers (tried 2026-08-23, removed):
 #   * vllm/model_executor/offloader/uva.py implements exactly what we wanted
 #     (weights in pinned host RAM, mapped into the GPU address space via UVA,
 #     read over PCIe during the forward; compute stays on GPU, CPU never runs
@@ -50,17 +69,18 @@ bash single-user/start_qwen.sh
 #     its blocks with a plain `nn.ModuleList` (qwen3_vl.py:628), so the
 #     offloader never sees them. Confirmed: no "Total CPU offloaded
 #     parameters" line is logged, and the KV pool shrinks by the full tower.
-# Making this work would need a patch routing Qwen3_VisionTransformer.blocks
-# through get_offloader().wrap_modules() -- plausible (the ViT is neither
-# torch.compile'd nor cudagraph'd here: compile_mm_encoder / cudagraph_mm_encoder
-# are both False) but unmeasured, so not attempted yet.
+# That is what patches/vision-tower-cpu-offload.patch fixes, by routing
+# Qwen3_VisionTransformer.blocks through a dedicated UVAOffloader --
+# VLLM_VISION_CPU_OFFLOAD_GB above. It works; it is just not worth it by
+# default at the measured latency cost.
 #
-# Net effect: the vision tower lives in VRAM and costs ~0.94 GiB of KV pool --
+# Net effect at the shipped default (VLLM_VISION_CPU_OFFLOAD_GB=0): the vision
+# tower lives in VRAM and costs ~0.94 GiB of KV pool --
 # 6.11 GiB / 171,956 tokens / 225 blocks  ->  5.17 GiB / 145,326 tokens / ~190
 # blocks. A single full-length request still fits (145,326 > MAX_LEN 140,000);
 # what shrinks is concurrency headroom, so watch for preemptions under heavy
-# multi-conversation load and consider MAX_SEQS=6 if they appear. Set VISION=0
-# to get the pool back.
+# multi-conversation load and consider MAX_SEQS=6 if they appear. VISION=0 gets
+# the whole pool back (tower not instantiated at all).
 #
 #   --limit-mm-per-prompt {"image":{"count":2,"width":1280,"height":1280},"video":0}
 # NOT optional. The default is 999 items per modality, and startup memory
