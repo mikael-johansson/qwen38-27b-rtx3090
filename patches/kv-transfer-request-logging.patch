@@ -1,0 +1,265 @@
+Readable per-request KV transfer logging: one INFO line per tier movement.
+
+The offloading connector already emits plenty of DEBUG detail, but all of it
+is written for tracing one mechanism at a time -- chunk indices, job ids,
+per-group skip decisions. None of it answers the question you actually have
+while watching a live server: did this request's context come off the disk,
+and how much of it moved? Answering that today means grepping several
+different DEBUG lines across two modules and correlating them by hand.
+
+This adds vllm/v1/kv_offload/transfer_log.py and calls it from the four
+points where blocks actually change tier, producing lines like:
+
+    KV LOAD  chatcmpl-a9b273614cd4c815-99de3654 | fs   -> RAM  |  44 blk
+    KV LOAD  chatcmpl-a9b273614cd4c815-99de3654 | RAM  -> VRAM |  44 blk /  36608 tok (GPU had 50752 tok)
+    KV STORE chatcmpl-b88083b7827488ae | VRAM -> RAM  |  12 blk /   9984 tok
+    KV STORE chatcmpl-b88083b7827488ae | RAM  -> fs   |  12 blk
+
+Both directions are two-legged because that is what the tiering manager
+really does: secondary tiers cannot touch GPU memory, so a disk-backed
+resume is promoted fs -> RAM first and only then pulled RAM -> VRAM. Each
+leg is logged where it happens, so the pair reads top to bottom.
+
+Placement:
+  - tiering/manager.py _flush_pending_promotions()  -> "<tier> -> RAM"
+  - tiering/manager.py complete_store() cascade     -> "RAM -> <tier>"
+  - offloading/scheduler.py _lookup()               -> "RAM -> VRAM"
+  - offloading/scheduler.py _build_store_jobs()     -> "VRAM -> RAM"
+
+INFO, and on by default: the point is to sit next to the request log without
+switching all of vLLM to DEBUG, which buries it. VLLM_KV_TRANSFER_LOG=0
+silences it. Read once at import rather than per block -- this sits in a
+per-transfer path.
+
+Two details worth knowing when reading the output:
+
+  - The connector caches the chunk size in __init__ as _log_chunk_tokens
+    instead of reusing the loop-local tokens_per_chunk near the _lookup log
+    site. That name is only bound inside the per-group branches, so touching
+    it on a path that skipped them (no sliding-window groups, nothing in
+    flight) would raise UnboundLocalError -- a logging statement must not be
+    able to fail the request.
+
+  - On the STORE line the block and token columns do not divide into each
+    other. keys_to_store spans all four KV-cache groups (3 mamba + 1 full
+    attention), so the block column counts per-group blocks while the token
+    column is the request-level span they cover.
+
+diff --git a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 5998c24..c820597 100644
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -54,6 +54,7 @@ from vllm.v1.kv_offload.base import (
+     TierMatcher,
+     make_offload_key,
+ )
++from vllm.v1.kv_offload.transfer_log import log_kv_transfer
+ from vllm.v1.outputs import KVConnectorOutput
+ from vllm.v1.request import Request, RequestStatus
+ 
+@@ -521,6 +522,16 @@ class OffloadingConnectorScheduler:
+         self.manager: OffloadingManager = spec.get_manager()
+         self._connector_stats = OffloadingConnectorStats()
+ 
++        # Chunk size used only to turn token counts into block counts for the
++        # KV transfer log. All groups share block_size here (832), so the first
++        # group's value is representative; 0 disables the block column rather
++        # than risking a division by zero on an exotic config.
++        self._log_chunk_tokens = (
++            self.config.kv_group_configs[0].tokens_per_chunk
++            if self.config.kv_group_configs
++            else 0
++        )
++
+         full_attention_groups: list[int] = []
+         sliding_window_groups: list[int] = []
+         for group_config in self.config.kv_group_configs:
+@@ -935,6 +946,25 @@ class OffloadingConnectorScheduler:
+             num_hit_tokens,
+             num_computed_tokens,
+         )
++        # Staged promotion, leg 2 of 2: primary -> GPU. Anything that had to
++        # come off a secondary tier first was logged as "<tier> -> RAM" by the
++        # tiering manager, so a disk-backed resume reads as two lines.
++        #
++        # Read the chunk size off self.config rather than reusing the loop-local
++        # tokens_per_chunk above: that name is only bound inside the per-group
++        # branches, so touching it here raises UnboundLocalError on any path
++        # that skipped them (e.g. no sliding-window groups and nothing in
++        # flight).
++        chunk_tokens = self._log_chunk_tokens
++        log_kv_transfer(
++            "LOAD",
++            req_status.req.request_id,
++            "RAM",
++            "VRAM",
++            num_hit_tokens // chunk_tokens if chunk_tokens else 0,
++            num_hit_tokens,
++            note=f"GPU had {num_computed_tokens} tok",
++        )
+ 
+         return num_hit_tokens
+ 
+@@ -1313,6 +1343,24 @@ class OffloadingConnectorScheduler:
+ 
+             keys_to_store = set(store_output.keys_to_store)
+ 
++            # First leg of the offload: GPU -> primary (RAM). The cascade on to
++            # any secondary tier is logged separately by the tiering manager as
++            # "RAM -> <tier>", so a block that ends up on NVMe produces two
++            # lines here too, mirroring the two-line LOAD path.
++            #
++            # keys_to_store spans all KV groups (3 mamba + 1 full-attention
++            # here), so the block column counts per-group blocks while the token
++            # column is the request-level span they cover -- they are not
++            # meant to divide into each other.
++            log_kv_transfer(
++                "STORE",
++                req.request_id,
++                "VRAM",
++                "RAM",
++                len(keys_to_store),
++                num_offloadable_tokens,
++            )
++
+             group_sizes: list[int] = []
+             block_indices: list[int] = []
+             src_block_ids: list[int] = []
+diff --git a/v1/kv_offload/tiering/manager.py b/v1/kv_offload/tiering/manager.py
+index d1d3c42..cf231c6 100644
+--- a/v1/kv_offload/tiering/manager.py
++++ b/v1/kv_offload/tiering/manager.py
+@@ -46,6 +46,7 @@ from vllm.v1.kv_offload.base import (
+ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
++from vllm.v1.kv_offload.transfer_log import log_kv_transfer
+ from vllm.v1.kv_offload.tiering.base import (
+     JobId,
+     JobMetadata,
+@@ -446,6 +447,16 @@ class TieringOffloadingManager(OffloadingManager):
+                     req_context=entry.req_context,
+                 )
+                 self._transfer_jobs[job_id] = job_metadata
++                # Staged promotion, leg 1 of 2: secondary -> primary. The
++                # matching "RAM -> VRAM" leg is logged by the connector
++                # scheduler once the block is actually pulled onto the GPU.
++                log_kv_transfer(
++                    "LOAD",
++                    entry.req_context.req_id,
++                    tier.tier_type,
++                    "RAM",
++                    len(entry.keys),
++                )
+                 tier.submit_load(job_metadata)
+ 
+         self._pending_load_submissions.clear()
+@@ -619,6 +630,16 @@ class TieringOffloadingManager(OffloadingManager):
+             # secondary tier.
+             for tier in self.secondary_tiers:
+                 job_metadata = self.create_store_job(keys, req_context)
++                # Cascade leg: primary -> secondary. The preceding
++                # "VRAM -> RAM" leg is logged by the connector scheduler when
++                # it builds the store job.
++                log_kv_transfer(
++                    "STORE",
++                    req_context.req_id,
++                    "RAM",
++                    tier.tier_type,
++                    len(keys),
++                )
+                 tier.submit_store(job_metadata)
+ 
+         # Note: The async transfers are now in flight. Their completion is
+diff --git a/v1/kv_offload/transfer_log.py b/v1/kv_offload/transfer_log.py
+new file mode 100644
+index 0000000..accf2b5
+--- /dev/null
++++ b/v1/kv_offload/transfer_log.py
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Readable per-request logging for KV block movement between tiers.
++
++The offloading connector already emits a lot of DEBUG detail, but it is
++written for tracing one mechanism at a time: chunk indices, job ids, per-group
++skip decisions. None of it answers the question you actually have while
++watching a live server -- *did this request's context come off the disk, and
++how much of it moved?*
++
++This module emits one INFO line per transfer, interspersed in the normal log:
++
++    KV LOAD  chatcmpl-a9b273614cd4c815 | fs   -> RAM  |  44 blk
++    KV LOAD  chatcmpl-a9b273614cd4c815 | RAM  -> VRAM |  44 blk /  36608 tok (GPU had 50752 tok)
++    KV STORE chatcmpl-b88083b7827488ae | VRAM -> RAM  |  12 blk /   9984 tok
++    KV STORE chatcmpl-b88083b7827488ae | RAM  -> fs   |  12 blk
++
++A full disk-backed resume therefore reads top to bottom as
++``fs -> RAM`` then ``RAM -> VRAM``, which is the staged promotion the tiering
++manager actually performs (secondary tiers cannot touch GPU memory directly).
++
++Set VLLM_KV_TRANSFER_LOG=0 to silence it. It is deliberately INFO and on by
++default: the whole point is to be visible next to the request log without
++turning on DEBUG for all of vLLM, which buries it.
++"""
++
++import os
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# Read once at import. This is a deployment-level switch, not something that
++# should be re-checked in a per-block hot path.
++_ENABLED = os.environ.get("VLLM_KV_TRANSFER_LOG", "1") != "0"
++
++# Request ids are long ("chatcmpl-<32 hex>-<8 hex>" once the connector appends
++# its own suffix). Keep the head, which is what appears in the request log
++# filenames and in the API response, so lines can be grepped against those.
++_REQ_ID_MAX = 34
++
++
++def kv_transfer_log_enabled() -> bool:
++    return _ENABLED
++
++
++def _short_req_id(req_id: str) -> str:
++    if len(req_id) <= _REQ_ID_MAX:
++        return req_id
++    return req_id[:_REQ_ID_MAX] + "…"
++
++
++def log_kv_transfer(
++    action: str,
++    req_id: str,
++    src: str,
++    dst: str,
++    num_blocks: int,
++    num_tokens: int | None = None,
++    note: str = "",
++) -> None:
++    """Emit one readable transfer line.
++
++    Args:
++        action: "LOAD", "STORE" or "EVICT".
++        req_id: Owning request. Evictions may not have one; pass "-".
++        src, dst: Tier labels -- "VRAM", "RAM", or a secondary tier_type ("fs").
++        num_blocks: Blocks moved.
++        num_tokens: Tokens, when the caller knows the block size.
++        note: Optional trailing context, e.g. "GPU had 50752 tok".
++    """
++    if not _ENABLED or num_blocks <= 0:
++        return
++    if num_tokens is None:
++        size = f"{num_blocks:3d} blk"
++    else:
++        size = f"{num_blocks:3d} blk / {num_tokens:6d} tok"
++    logger.info(
++        "KV %-5s %s | %-4s -> %-4s | %s%s",
++        action,
++        _short_req_id(req_id),
++        src,
++        dst,
++        size,
++        f" ({note})" if note else "",
++    )
