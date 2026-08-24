@@ -1,0 +1,399 @@
+TEMPORARY diagnostic patch, RESTORE_CORRUPTION_PLAN.md Phase C
+("checksum triangulation"). Not meant to ship -- delete once the restore-
+corruption investigation (docs/kv-offload-cache-identity-corruption.md)
+closes. Adds content checksums at three points in the KV-offload
+restore path, gated behind VLLM_KV_RESTORE_CHECKSUM=1 (off by default,
+zero cost when unset):
+
+  (a) STORE_DONE  -- v1/kv_offload/cpu/gpu_worker.py, SingleDirection-
+      OffloadingHandler.get_finished(): once a GPU->CPU store transfer's
+      end_event confirms completion, crc32 each copied CPU row (one row
+      = one (layer, chunk-page) unit). Metadata (tensor_idx, cpu_tensor,
+      cpu_block_id, gpu_block_id) is captured at submission time in
+      transfer_async() and stashed on the new Transfer.checksum_meta
+      field so get_finished() can hash without re-deriving pointers.
+      Deferred to completion (not submission) because the GPU->CPU copy
+      is async -- hashing before end_event fires would read stale CPU
+      memory, not the just-written content.
+
+  (b) LOAD_SUBMIT -- same file, transfer_async(), CPU->GPU direction:
+      crc32 each CPU row about to be read, at submission time (before
+      the async copy starts, per the plan -- CPU-tier content is static
+      at this point so submission-time and completion-time reads are
+      equivalent, but submission is cheaper and avoids adding a second
+      hook in get_finished).
+
+  (c) RESTORE_READ -- v1/worker/mamba_utils.py, preprocess_mamba(): when
+      prev_state_idx has no local mamba_state_idx history (the cold-
+      resume fallback `(num_computed_tokens - 1) // block_size`, which
+      fires identically for an offload restore AND an ordinary local
+      prefix-cache-hit new conversation turn -- exactly the two-case
+      comparison Phase C needs), crc32 the GPU state block at that index
+      for every mamba layer before this step's forward pass reads it.
+      Costs one .cpu() sync per layer; only runs under the debug env var.
+
+Both (b) and (c) use the same crc32-over-logical-bytes scheme and are
+both tagged by GPU block id, so LOAD_SUBMIT and RESTORE_READ rows for the
+same restore join directly on (gpu_blk, crc). (a) and (b)/(STORE_DONE and
+a later LOAD_SUBMIT for the same offload key) join on cpu_blk instead,
+since CPU-tier block allocation is content-addressed and stable across a
+store -> (idle in RAM) -> load round trip for one key, while GPU block
+ids get reused across unrelated allocations over a session's lifetime and
+so cannot correlate a store to a much-later load of the same content.
+
+Also adds one symmetric debug line, LOAD_JOB_BLOCKS (distributed/kv_
+transfer/kv_connector/v1/offloading/scheduler.py, update_state_after_
+alloc()) -- the existing offload-verbose-eviction-debug-logging.patch
+already logs STORE_JOB_BLOCKS (job -> req_id, src_block_ids) but had no
+load-side equivalent; this fills that gap so a load job's job_id can be
+correlated back to its req_id and offload keys the same way.
+
+Verification: applies cleanly (bash verify.sh --no-server); with
+VLLM_KV_RESTORE_CHECKSUM unset, behavior and output are byte-identical to
+before (all new code is behind `if _CHECKSUM_ENABLED:`). With it set to
+1, `grep RESTORE_CHECKSUM qwen.log` produces STORE_DONE / LOAD_SUBMIT /
+RESTORE_READ lines during test_kv_cache_identity_corruption.py runs, see
+RESULTS-restore-corruption.md Phase C for the actual triangulation.
+
+a/v1/kv_offload/cpu/gpu_worker.py	2026-08-24 10:25:29.688876140 +0000
+b/v1/kv_offload/cpu/gpu_worker.py	2026-08-24 10:54:51.410430106 +0000
+@@ -1,9 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import functools
++import os
+ import time
++import zlib
+ from collections import deque
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ 
+ import numpy as np
+ import torch
+@@ -31,6 +33,55 @@
+ 
+ logger = init_logger(__name__)
+ 
++# TEMPORARY (RESTORE_CORRUPTION_PLAN.md Phase C): per-chunk CPU-side content
++# checksums for the KV-offload restore-corruption investigation. Set
++# VLLM_KV_RESTORE_CHECKSUM=1 to enable. Emits one INFO line per (layer, CPU
++# row) copied, tagged by the CPU-tier block id (stable across a store->load
++# round trip for the same offload key, since CPU block allocation is content-
++# addressed) and the GPU-side block id (stable for the lifetime of one load's
++# destination, letting v1/worker/mamba_utils.py's restore-time checksum join
++# against it directly). Revert by deleting this patch; not meant to ship.
++_CHECKSUM_ENABLED = os.environ.get("VLLM_KV_RESTORE_CHECKSUM", "0") == "1"
++
++
++def _row_crc32(tensor: torch.Tensor, row_idx: int, unpadded_bytes: int) -> tuple[int, int]:
++    """CRC32 + byte length of one CPU tensor row (a single (layer, chunk) page).
++
++    Truncated to unpadded_bytes: the CPU tensor's row stride is sized to the
++    *padded* page_size_bytes (CanonicalKVCacheTensor.page_size_bytes), but
++    only the first data_ref.page_size_bytes (unpadded) are real data -- the
++    same convention compute_sub_block_ptrs's all_sizes[...] already uses for
++    the copy itself. Without truncating, this would never match the GPU
++    tensor's natural (unpadded) per-block stride in mamba_utils.py's
++    RESTORE_READ, regardless of correctness.
++    """
++    row = tensor[row_idx, :unpadded_bytes]
++    data = row.numpy().tobytes()
++    return zlib.crc32(data), len(data)
++
++
++def _log_restore_checksum(
++    action: str,
++    job_id: int,
++    tensor_idx: int,
++    cpu_block_id: int,
++    gpu_block_id: int,
++    cpu_tensor: torch.Tensor,
++    cpu_row_idx: int,
++    unpadded_bytes: int,
++) -> None:
++    crc, nbytes = _row_crc32(cpu_tensor, cpu_row_idx, unpadded_bytes)
++    logger.info(
++        "RESTORE_CHECKSUM %s job=%d tidx=%d cpu_blk=%d gpu_blk=%d bytes=%d crc=%08x",
++        action,
++        job_id,
++        tensor_idx,
++        cpu_block_id,
++        gpu_block_id,
++        nbytes,
++        crc,
++    )
++
+ 
+ def _select_swap_blocks_fn(
+     kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
+@@ -68,6 +119,14 @@
+     batch_src: torch.Tensor
+     batch_dst: torch.Tensor
+     batch_sizes: torch.Tensor
++    # TEMPORARY (Phase C checksum instrument, VLLM_KV_RESTORE_CHECKSUM=1):
++    # (tensor_idx, cpu_tensor, cpu_block_id, gpu_block_id, unpadded_bytes)
++    # per (layer, row) copied in a GPU->CPU store job, hashed once the copy
++    # is confirmed complete in get_finished(). None when the instrument is
++    # off.
++    checksum_meta: list[tuple[int, torch.Tensor, int, int, int]] | None = field(
++        default=None
++    )
+ 
+ 
+ def compute_sub_block_ptrs(
+@@ -307,6 +366,9 @@
+         op_idx = 0
+         # count total number of bytes copied
+         num_transfer_bytes = 0
++        checksum_meta: list[tuple[int, torch.Tensor, int, int, int]] | None = (
++            [] if _CHECKSUM_ENABLED and self.gpu_to_cpu else None
++        )
+         for group_size, block_idx, group_data_refs in zip(
+             group_sizes, block_indices, self.kv_cache_groups_data_refs
+         ):
+@@ -329,6 +391,33 @@
+             group_src = src_blocks[src_offset:src_end_offset]
+             group_dst = dst_blocks[dst_offset:dst_end_offset]
+ 
++            if _CHECKSUM_ENABLED:
++                # CPU side may pack multiple GPU-sized sub-blocks per row
++                # (blocks_per_chunk > 1); expand to one row id per op the
++                # same way compute_sub_block_ptrs expands pointers, but keep
++                # the row *id* (not a byte pointer) so we can index the
++                # tensor directly for hashing. GPU side is always 1:1.
++                if self.gpu_to_cpu:
++                    cpu_ids_raw, cpu_bpc, cpu_skip = (
++                        group_dst,
++                        self.dst_blocks_per_chunk,
++                        dst_logical_blocks_to_skip,
++                    )
++                    gpu_group_blocks = group_src
++                else:
++                    cpu_ids_raw, cpu_bpc, cpu_skip = (
++                        group_src,
++                        self.src_blocks_per_chunk,
++                        src_logical_blocks_to_skip,
++                    )
++                    gpu_group_blocks = group_dst
++                if cpu_bpc == 1:
++                    cpu_row_ids = cpu_ids_raw[:group_size]
++                else:
++                    cpu_row_ids = np.repeat(
++                        cpu_ids_raw.astype(np.int64), cpu_bpc
++                    )[cpu_skip : cpu_skip + group_size]
++
+             for data_ref in group_data_refs:
+                 t_idx = data_ref.tensor_idx
+                 end_idx = op_idx + group_size
+@@ -350,6 +439,42 @@
+ 
+                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+                 num_transfer_bytes += group_size * data_ref.page_size_bytes
++
++                if _CHECKSUM_ENABLED:
++                    cpu_tensor = (
++                        self.dst_tensors[t_idx]
++                        if self.gpu_to_cpu
++                        else self.src_tensors[t_idx]
++                    )
++                    for j in range(group_size):
++                        cpu_blk = int(cpu_row_ids[j])
++                        gpu_blk = int(gpu_group_blocks[j])
++                        if self.gpu_to_cpu:
++                            # STORE: hash after completion (get_finished),
++                            # not now -- the async copy hasn't run yet.
++                            checksum_meta.append(
++                                (
++                                    t_idx,
++                                    cpu_tensor,
++                                    cpu_blk,
++                                    gpu_blk,
++                                    data_ref.page_size_bytes,
++                                )
++                            )
++                        else:
++                            # LOAD: hash the CPU source now, before the
++                            # async copy starts (plan's "at load submission").
++                            _log_restore_checksum(
++                                "LOAD_SUBMIT",
++                                job_id,
++                                t_idx,
++                                cpu_blk,
++                                gpu_blk,
++                                cpu_tensor,
++                                cpu_blk,
++                                data_ref.page_size_bytes,
++                            )
++
+                 op_idx = end_idx
+ 
+             src_offset = src_end_offset
+@@ -410,6 +535,7 @@
+                 batch_src=batch_src,
+                 batch_dst=batch_dst,
+                 batch_sizes=batch_sizes,
++                checksum_meta=checksum_meta,
+             )
+         )
+ 
+@@ -420,6 +546,21 @@
+         results: list[TransferResult] = []
+         while self._transfers and self._transfers[0].end_event.query():
+             transfer = self._transfers.popleft()
++            if transfer.checksum_meta:
++                # STORE completion (Phase C instrument): the GPU->CPU copy
++                # is now confirmed done (end_event queried True), so the CPU
++                # rows hold this step's actual stored content.
++                for t_idx, cpu_tensor, cpu_blk, gpu_blk, unpadded in transfer.checksum_meta:
++                    _log_restore_checksum(
++                        "STORE_DONE",
++                        transfer.job_id,
++                        t_idx,
++                        cpu_blk,
++                        gpu_blk,
++                        cpu_tensor,
++                        cpu_blk,
++                        unpadded,
++                    )
+             transfer_time = (
+                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
+             )  # elapsed_time is in milliseconds
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-08-24 10:25:29.689876126 +0000
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-08-24 10:24:38.103570695 +0000
+@@ -1136,6 +1136,14 @@
+             src_spec=src_spec,
+             dst_spec=dst_spec,
+         )
++        logger.debug(
++            "request-logging offload-verbose: %s LOAD_JOB_BLOCKS job=%d "
++            "dst_block_ids=%s keys=%s",
++            request.request_id,
++            load_job_id,
++            dst_block_ids,
++            keys_to_load,
++        )
+         # a load can only be issued when no other jobs are pending.
+         assert not req_status.transfer_jobs
+         req_status.transfer_jobs.add(load_job_id)
+a/v1/worker/mamba_utils.py	2026-08-24 10:25:29.690876113 +0000
+b/v1/worker/mamba_utils.py	2026-08-24 10:40:58.907479172 +0000
+@@ -2,12 +2,15 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import dataclasses
+ import itertools
++import os
++import zlib
+ from collections.abc import Callable
+ from typing import Any, NamedTuple
+ 
+ import torch
+ 
+ from vllm.config import CacheConfig
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFunc,
+     get_conv_copy_spec,
+@@ -22,6 +25,22 @@
+ from vllm.v1.worker.gpu_input_batch import CachedRequestState
+ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+ 
++logger = init_logger(__name__)
++
++# TEMPORARY (RESTORE_CORRUPTION_PLAN.md Phase C): GPU-side checksum of the
++# mamba running-state block a resumed/restored request reads its initial
++# state from, taken at the moment preprocess_mamba falls back to computing
++# prev_state_idx from num_computed_tokens (i.e. this worker has no local
++# mamba_state_idx history for the request -- true for both an offload
++# restore AND an ordinary local-prefix-cache-hit new turn, which is exactly
++# the comparison Phase C needs). Set VLLM_KV_RESTORE_CHECKSUM=1 to enable.
++# Uses the same crc32-over-raw-bytes scheme as the CPU-side checksums in
++# v1/kv_offload/cpu/gpu_worker.py so RESTORE_READ rows are directly
++# comparable to that file's LOAD_SUBMIT rows by (gpu_blk, crc). Costs a
++# .cpu() sync per mamba layer -- only runs under the debug env var. Revert
++# by deleting this patch; not meant to ship.
++_CHECKSUM_ENABLED = os.environ.get("VLLM_KV_RESTORE_CHECKSUM", "0") == "1"
++
+ 
+ @triton.jit
+ def _copy_mamba_state_block(
+@@ -1030,6 +1049,63 @@
+     )
+ 
+ 
++def _log_restore_read_checksums(
++    req_id: str,
++    num_computed_tokens: int,
++    prev_state_idx: int,
++    mamba_group_ids: list[int],
++    kv_cache_config: KVCacheConfig,
++    req_state: CachedRequestState,
++    forward_context: dict[str, Any],
++) -> None:
++    """Phase C instrument: hash the mamba state block a cold-resumed request
++    (offload restore OR ordinary local prefix-cache-hit new turn) is about
++    to read its running state from. See module docstring note above."""
++    for gid in mamba_group_ids:
++        block_ids = req_state.block_ids[gid]
++        if prev_state_idx >= len(block_ids):
++            continue
++        block_id = block_ids[prev_state_idx]
++        layer_names = kv_cache_config.kv_cache_groups[gid].layer_names
++        for layer_idx, layer_name in enumerate(layer_names):
++            attention = forward_context.get(layer_name)
++            if attention is None:
++                continue
++            kv_caches: list[torch.Tensor] = attention.kv_cache
++            # v1/kv_offload's register_kv_caches() (worker.py, MambaSpec
++            # branch) offloads ONE combined per-layer page
++            # (kv_caches[layer_name].view(num_blocks, page_size_bytes)),
++            # not one page per state type -- conv_state and temporal/ssm
++            # state are views into that same physical storage. Concatenate
++            # them here in the same (state_type) order so this hash is
++            # over the identical byte range gpu_worker.py's STORE_DONE /
++            # LOAD_SUBMIT hash covers per (layer, gpu_blk); hashing each
++            # state type separately would never match those by
++            # construction, regardless of correctness.
++            chunks = []
++            for state in kv_caches:
++                # view as uint8 before leaving the GPU: torch.Tensor.numpy()
++                # has no bfloat16 support, and this also makes the hash
++                # dtype-agnostic (compares raw bytes either way).
++                row_bytes = state[block_id].contiguous().view(torch.uint8)
++                chunks.append(row_bytes.cpu().numpy().tobytes())
++            data = b"".join(chunks)
++            crc = zlib.crc32(data)
++            logger.info(
++                "RESTORE_CHECKSUM RESTORE_READ req=%s computed=%d "
++                "prev_state_idx=%d group=%d layer_idx=%d "
++                "gpu_blk=%d bytes=%d crc=%08x",
++                req_id,
++                num_computed_tokens,
++                prev_state_idx,
++                gid,
++                layer_idx,
++                block_id,
++                len(data),
++                crc,
++            )
++
++
+ def preprocess_mamba(
+     scheduler_output: SchedulerOutput,
+     kv_cache_config: KVCacheConfig,
+@@ -1081,6 +1157,16 @@
+         if prev_state_idx is None:
+             # New / resumed request; num_computed_tokens == 0 gives -1.
+             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
++            if _CHECKSUM_ENABLED and prev_state_idx != -1:
++                _log_restore_read_checksums(
++                    req_id,
++                    req_state.num_computed_tokens,
++                    prev_state_idx,
++                    mamba_group_ids,
++                    kv_cache_config,
++                    req_state,
++                    forward_context,
++                )
+ 
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+         num_blocks = (
