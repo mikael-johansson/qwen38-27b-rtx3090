@@ -1,0 +1,213 @@
+Add: readable per-request arrival/completion logging (NEW REQUEST /
+FINISHED), replacing the noisy per-engine-step "generation [...] | GPU KV
+cache usage: ...%" line (--enable-logging-iteration-details) as the
+day-to-day way to watch a live server.
+
+Motivation: --enable-logging-iteration-details (ITERATION_LOG=1 in
+micke-start.sh) logs one line per non-dummy engine step. Under MTP
+speculative decoding this deployment runs, that's nearly every decode
+step of every live generation -- e.g.
+"Engine 000: generation [chatcmpl-...] (1 req, 4 verified, 1 accepted) =
+81.2 tok/s | GPU KV cache usage: 14.7%" firing several times a second per
+active conversation. Useful for step-by-step debugging, but too frequent
+to actually read live, and it answers "what is the engine doing right
+now" rather than what you actually want while watching a server: did
+this request show up with a warm cache, and how did it do end to end?
+micke-start.sh's ITERATION_LOG default flipped to 0 in the same change
+that adds this (per-request lines below cover the everyday use case; the
+per-step detail is still available via ITERATION_LOG=1 for debugging).
+
+New module: v1/engine/request_lifecycle_log.py, following the same
+pattern as the existing v1/kv_offload/transfer_log.py (readable per-
+request KV block transfer logging from an earlier session of this
+deployment's investigation): plain INFO logger.info() calls, gated by an
+env var read once at import (VLLM_REQUEST_LIFECYCLE_LOG, default on,
+matching VLLM_KV_TRANSFER_LOG's convention), request ids truncated the
+same way (_REQ_ID_MAX=34, matching what appears in request log filenames
+and the API response) so all of KV LOAD/STORE, generation, NEW REQUEST
+and FINISHED lines can be grepped together by the same id prefix.
+
+Two call sites, both in v1/engine/output_processor.py (no new fields
+needed -- every value used was already being computed and stored on
+RequestState/RequestStateStats for Prometheus, just never surfaced as a
+readable line):
+
+- NEW REQUEST, in process_outputs()'s existing `if req_state.is_prefilling
+  and engine_core_output.prefill_stats is not None:` block -- this is the
+  earliest point a request's cache-hit outcome is actually known (not
+  admission time: the cached fraction isn't determined until the first
+  prefill chunk runs). Uses req_state.prompt_len and the
+  num_cached_tokens just captured onto req_state on the very same lines.
+  Fires exactly once per request (guarded by is_prefilling's one-way
+  True->False transition, same guard the existing code already relies
+  on).
+
+- FINISHED, in _update_stats_from_finished() -- fires exactly once per
+  request, when finish_reason is not None. Reuses
+  req_state.stats (RequestStateStats): first_token_ts, scheduled_ts,
+  last_token_ts and first_token_latency are already populated by
+  IterationStats.update_from_output() by the time this runs (same fields
+  vLLM's own update_from_finished_request() uses two lines below, for
+  the Prometheus FinishedRequestStats path) -- prefill_time =
+  first_token_ts - scheduled_ts, decode_time = last_token_ts -
+  first_token_ts, matching that existing computation exactly. PP token
+  count is req_state.prompt_len - req_state.num_cached_tokens (the
+  PrefillStats invariant computed - prompt - cached already guarantees
+  this equals num_computed_tokens, so no new field needed on
+  RequestState). An aborted/errored request that never reached
+  scheduling has all these timestamps at their 0.0 default; the format
+  functions render "?" for a rate instead of dividing by a zero or
+  negative interval, so this never raises or prints a nonsense rate.
+
+Sample output:
+
+    NEW REQUEST chatcmpl-b746f047edffef5e-9a1f8167: 83746 prompt (97.5% cached, 742 uncached tokens)
+    FINISHED    chatcmpl-b746f047edffef5e-9a1f8167: 83746 tokens prompt, PP 742 tok / 101.3 PPtok/s TTFT: 7.5s, GEN: 237 tokens (87.5 tok/s)
+
+Verification: syntax-checked (ast.parse), `import
+vllm.v1.engine.output_processor` succeeds standalone (no circular-import
+issue from the new module), `verify.sh --no-server` green. Not yet
+observed against live traffic in this session -- watch qwen.log after
+the next restart for NEW REQUEST/FINISHED lines appearing per request
+instead of the old per-step generation line.
+--- a/v1/engine/output_processor.py
++++ b/v1/engine/output_processor.py
+@@ -31,6 +31,7 @@
+ from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+ from vllm.v1.engine.logprobs import LogprobsProcessor
+ from vllm.v1.engine.parallel_sampling import ParentRequest
++from vllm.v1.engine.request_lifecycle_log import log_finished_request, log_new_request
+ from vllm.v1.metrics.stats import (
+     IterationStats,
+     LoRARequestStates,
+@@ -647,6 +648,11 @@
+                     req_state.num_cache_creation_tokens = (
+                         engine_core_output.prefill_stats.num_cache_creation_tokens
+                     )
++                    log_new_request(
++                        req_state.request_id,
++                        req_state.prompt_len,
++                        req_state.num_cached_tokens,
++                    )
+                 req_state.is_prefilling = False
+ 
+             if pooling_output is None:
+@@ -821,6 +827,15 @@
+ 
+         assert finish_reason is not None
+         assert req_state.stats is not None
++        log_finished_request(
++            req_state.request_id,
++            req_state.prompt_len,
++            req_state.prompt_len - req_state.num_cached_tokens,
++            req_state.stats.first_token_ts - req_state.stats.scheduled_ts,
++            req_state.stats.first_token_latency,
++            req_state.stats.num_generation_tokens,
++            req_state.stats.last_token_ts - req_state.stats.first_token_ts,
++        )
+         iteration_stats.update_from_finished_request(
+             finish_reason=finish_reason,
+             request_id=req_state.external_req_id,
+--- /dev/null
++++ b/v1/engine/request_lifecycle_log.py
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Readable per-request arrival/completion logging.
++
++The default per-iteration logging (--enable-logging-iteration-details)
++answers "what is the engine doing right now", but at typical decode
++cadences (one engine step per few tokens under speculative decoding) it
++fires on nearly every step -- too frequent to read live. What you actually
++want while watching a server is coarser: *did this request show up with a
++warm cache, and how did it do end to end?* This module emits exactly two
++lines per request, independent of how many engine steps it took:
++
++    NEW REQUEST chatcmpl-b746f047edffef5e-9a1f8167: 83746 prompt (97.5% cached, 742 uncached tokens)
++    FINISHED    chatcmpl-b746f047edffef5e-9a1f8167: 83746 tokens prompt, PP 742 tok / 101.3 PPtok/s TTFT: 7.5s, GEN: 237 tokens (87.5 tok/s)
++
++The request id is the internal id (matches the "KV LOAD"/"KV STORE" lines
++in v1/kv_offload/transfer_log.py and the "generation [...]" lines from
++--enable-logging-iteration-details, so all four can be grepped together).
++
++Set VLLM_REQUEST_LIFECYCLE_LOG=0 to silence it. It is deliberately INFO
++and on by default: the whole point is to be visible next to the request
++log without turning on per-iteration debug logging.
++"""
++
++import os
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# Read once at import, like VLLM_KV_TRANSFER_LOG -- a deployment-level
++# switch, not something to re-check per request.
++_ENABLED = os.environ.get("VLLM_REQUEST_LIFECYCLE_LOG", "1") != "0"
++
++# Matches transfer_log.py's _REQ_ID_MAX: keep the head, which is what
++# appears in the request log filenames and the API response.
++_REQ_ID_MAX = 34
++
++
++def request_lifecycle_log_enabled() -> bool:
++    return _ENABLED
++
++
++def _short_req_id(req_id: str) -> str:
++    if len(req_id) <= _REQ_ID_MAX:
++        return req_id
++    return req_id[:_REQ_ID_MAX] + "…"
++
++
++def log_new_request(
++    req_id: str,
++    num_prompt_tokens: int,
++    num_cached_tokens: int,
++) -> None:
++    """Emit one line when a request's cache-hit outcome becomes known
++    (its first prefill chunk, not admission -- the cached fraction isn't
++    known any earlier than that)."""
++    if not _ENABLED:
++        return
++    num_uncached = num_prompt_tokens - num_cached_tokens
++    pct_cached = (
++        (num_cached_tokens / num_prompt_tokens * 100) if num_prompt_tokens else 0.0
++    )
++    logger.info(
++        "NEW REQUEST %s: %d prompt (%.1f%% cached, %d uncached tokens)",
++        _short_req_id(req_id),
++        num_prompt_tokens,
++        pct_cached,
++        num_uncached,
++    )
++
++
++def log_finished_request(
++    req_id: str,
++    num_prompt_tokens: int,
++    num_uncached_tokens: int,
++    prefill_time: float,
++    ttft: float,
++    num_generation_tokens: int,
++    decode_time: float,
++) -> None:
++    """Emit one line when a request finishes (all sampled, non-error
++    finish reasons -- errors/aborts skip this, nothing to summarize)."""
++    if not _ENABLED:
++        return
++    pp_rate = f"{num_uncached_tokens / prefill_time:.1f}" if prefill_time > 0 else "?"
++    gen_rate = (
++        f"{num_generation_tokens / decode_time:.1f}" if decode_time > 0 else "?"
++    )
++    logger.info(
++        "FINISHED %s: %d tokens prompt, PP %d tok / %s PPtok/s "
++        "TTFT: %.1fs, GEN: %d tokens (%s tok/s)",
++        _short_req_id(req_id),
++        num_prompt_tokens,
++        num_uncached_tokens,
++        pp_rate,
++        ttft,
++        num_generation_tokens,
++        gen_rate,
++    )

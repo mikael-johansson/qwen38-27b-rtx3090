@@ -1,0 +1,97 @@
+Fix: "KV Transfer metrics: ..." log line unreadable at typical
+VLLM_LOG_STATS_INTERVAL, e.g.:
+
+    KV Transfer metrics: vllm:kv_offload_cpu_cache_usage_perc=0.0,
+    vllm:kv_offload_cpu_cache_write_usage_perc=0.0, ...
+    vllm:kv_offload_lookup_sync_delay_seconds_sum=0.013403591030510142, ...
+
+(distributed/kv_transfer/kv_connector/v1/metrics.py,
+KVConnectorLogging.log() -- shared by every KV connector type, not just
+the offloading one this deployment uses).
+
+Root cause: `xfer_metrics_str = ", ".join(f"{k}={v}" for k, v in
+xfer_metrics.items())` dumps every key at full float repr precision
+(Python's default float-to-str, 17 significant digits worst case) and
+every key regardless of whether it's zero this interval -- an idle
+cache's *_usage_perc=0.0 triplet, empty histograms, etc. Every connector
+type's metric keys share a "vllm:" Prometheus-style prefix, repeated on
+every single key for no informational value in a log line (as opposed to
+a Prometheus scrape, where the prefix matters).
+
+Fix: strip the "vllm:" prefix, format floats to 4 significant figures
+(str.format's %.4g) instead of full repr, and skip zero-valued entries
+(both int 0 and float 0.0) -- a metric that's genuinely idle this
+interval isn't worth a line entry; if nothing non-zero was observed, skip
+the log line entirely instead of printing an empty "KV Transfer metrics:
+". Purely a formatting change: `reduce()`'s underlying dict and every
+connector's stats collection are untouched, so Prometheus metrics
+(scraped separately, not from this string) are unaffected.
+
+Also (follow-up in the same session, requested separately): the line had
+no on/off switch at all -- VLLM_LOG_STATS_INTERVAL only controls *how
+often* it fires, not whether it fires. Added `_METRICS_LOG_ENABLED =
+os.environ.get("VLLM_KV_TRANSFER_METRICS_LOG", "1") != "0"`, matching
+VLLM_KV_TRANSFER_LOG / v1/kv_offload/transfer_log.py's existing
+convention (read once at import, on by default). The accumulator is
+still reset every interval regardless of the gate, so disabling the log
+line doesn't leave stats accumulating unbounded -- only the `log_fn(...)`
+call itself is skipped.
+--- a/distributed/kv_transfer/kv_connector/v1/metrics.py
++++ b/distributed/kv_transfer/kv_connector/v1/metrics.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from dataclasses import dataclass, field
+ from typing import Any, TypeAlias, TypeVar
+ 
+@@ -14,6 +15,15 @@
+ 
+ logger = init_logger(__name__)
+ 
++# request-logging: gate for the periodic "KV Transfer metrics: ..." INFO
++# line (KVConnectorLogging.log(), below) -- independent of
++# VLLM_LOG_STATS_INTERVAL, which only controls how *often* it fires, not
++# whether it fires at all. Matches VLLM_KV_TRANSFER_LOG / v1/kv_offload/
++# transfer_log.py's convention: read once at import, on by default. The
++# Prometheus metrics themselves (KVConnectorProm, elsewhere in this file)
++# are untouched by this switch -- it only silences the log line.
++_METRICS_LOG_ENABLED = os.environ.get("VLLM_KV_TRANSFER_METRICS_LOG", "1") != "0"
++
+ 
+ @dataclass
+ class KVConnectorStats:
+@@ -99,10 +109,29 @@
+             # Produce a single cumulative stats object for the last time
+             # interval from the recorded observations.
+             xfer_metrics = self.transfer_stats_accumulator.reduce()
+-            xfer_metrics_str = ", ".join(f"{k}={v}" for k, v in xfer_metrics.items())
+-            log_fn("KV Transfer metrics: %s", xfer_metrics_str)
+-
+-            # Reset metrics for next interval
++            # request-logging readability fix: the raw dict has full-precision
++            # float reprs (e.g. "0.013403591030510142") and every zero-valued
++            # metric (most intervals have several, e.g. an idle cache's
++            # *_usage_perc=0.0), making the line unreadable at typical
++            # interval counts. Drop the shared "vllm:" prefix (every key
++            # across every connector type has it -- pure noise here), round
++            # floats to 4 significant figures, and skip zero-valued entries
++            # (a metric that fired is still shown at 0 via its sibling
++            # _count; a metric that's simply idle this interval isn't worth
++            # a line entry).
++            if _METRICS_LOG_ENABLED:
++                xfer_metrics_str = ", ".join(
++                    f"{k.removeprefix('vllm:')}="
++                    f"{f'{v:.4g}' if isinstance(v, float) else v}"
++                    for k, v in xfer_metrics.items()
++                    if v
++                )
++                if xfer_metrics_str:
++                    log_fn("KV Transfer metrics: %s", xfer_metrics_str)
++
++            # Reset metrics for next interval (independent of the log gate
++            # above -- the accumulator must not grow unbounded just because
++            # the line is silenced).
+             self.reset()
+ 
+ 

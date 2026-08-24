@@ -1,5 +1,5 @@
 #!/bin/sh
-ITERATION_LOG=1 \
+ITERATION_LOG=0 \
 REQUEST_LOG_DIR=$(pwd)/requests \
 VLLM_LOG_STATS_INTERVAL=10 \
 VLLM_CACHE_METRICS_WINDOW=3 \
@@ -11,6 +11,16 @@ VLLM_OFFLOAD_EAGLE_FALLBACK=0 \
 VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file-debug.json \
 EXTRA_ARGS='  --enable-auto-tool-choice --tool-call-parser qwen3_xml --long-prefill-token-threshold 832 --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":21474836480,"secondary_tiers":[{"type":"fs","root_dir":"/d/nvme_cache/vllm_kv","max_disk_gib":200}]}} --enable-cumem-allocator' \
 bash single-user/start_qwen.sh
+# ITERATION_LOG=0 (2026-08-24, was 1) -- --enable-logging-iteration-details
+# logs one line per non-dummy engine step ("generation [...] | GPU KV cache
+# usage: ...%"); under MTP spec-decode that's nearly every decode step, so
+# in practice it fired on almost every step of every live generation --
+# too frequent to read live. Left off by default now that
+# v1/engine/request_lifecycle_log.py (NEW REQUEST / FINISHED lines, one
+# per request instead of one per step) covers what this was actually being
+# read for. Still available -- set ITERATION_LOG=1 to turn the per-step
+# detail back on for debugging.
+#
 # PYTHONHASHSEED=0 -- fixes the KV-block hash chain's seed (NONE_HASH in
 # vllm/v1/core/kv_cache_utils.py) to a constant instead of os.urandom(32),
 # which vLLM otherwise regenerates fresh on every process start. Without

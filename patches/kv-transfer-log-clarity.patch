@@ -1,0 +1,163 @@
+Fix: "KV LOAD"/"KV STORE" lines (v1/kv_offload/transfer_log.py, wired
+from distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py)
+hard to interpret, e.g.:
+
+    KV STORE chatcmpl-... | VRAM -> RAM  |   4 blk /  53248 tok
+
+Reported directly by the user as confusing: "which blocks were
+transferred" isn't answerable from this line, and "53248 tok" reads like
+the size of a 4-block transfer when it isn't one.
+
+Root cause (STORE side): the token column was `num_offloadable_tokens`
+-- `_calc_num_offloadable_tokens()`'s result, essentially the request's
+whole computed-so-far frontier (~= req.num_computed_tokens), not the
+span this specific store moved. keys_to_store also spans every KV group
+(3 mamba + 1 full-attention in this deployment) with potentially
+different per-group progress, so there was never a single well-defined
+"tokens in this transfer" number available at the old call site --
+that's why the existing code comment already warned "not meant to
+divide into each other" rather than trying to fix it. Also, "VRAM ->
+RAM" reads like an eviction (blocks leaving VRAM) when a store is
+actually a COPY: the source blocks stay resident in VRAM (they have to,
+to be storable at all) and only gain a backup on the RAM tier.
+
+Fix:
+- STORE: derive the actual per-round delta from each group's
+  `next_stored_chunk_idx` (the same counter `_build_store_jobs`'s loop
+  already advances) -- take the MIN across groups both before and after
+  this round's advance (the same "shortest group wins" reasoning the
+  HIT_DIVERGED rescue elsewhere in this codebase uses for exactly this
+  kind of per-group-divergence problem: the min is the boundary a
+  restore can actually rely on), multiply by the uniform chunk-token
+  size (`self._log_chunk_tokens`, already used by the LOAD side), and
+  report that delta as the token column instead. Moved the log call from
+  before the per-group loop to after it, since the "after" value isn't
+  known until the loop has run. Added a note with both the new
+  cumulative RAM-backed total and (already in scope as
+  `num_tokens_after_batch`) the current VRAM-resident total, and called
+  the direction a copy, not an eviction, directly in the comment.
+- LOAD: kept the existing accurate "GPU had N tok" (before) and added
+  "now N+M tok in VRAM" (after) -- exact and free, since it's just the
+  existing `num_computed_tokens + num_hit_tokens`.
+
+Before/after:
+
+    KV STORE chatcmpl-... | VRAM -> RAM  |   4 blk /   1664 tok (now 53248 tok backed up in RAM, 55744 tok in VRAM)
+    KV LOAD  chatcmpl-... | RAM  -> VRAM |  44 blk /  36608 tok (had 50752 tok, now 87360 tok in VRAM)
+
+Verification: syntax-checked (ast.parse), `verify.sh --no-server` green.
+Not yet observed against live traffic -- the delta math (before/after
+min next_stored_chunk_idx across groups) is new and should be watched on
+the next restart to confirm the numbers look sane (delta tok column
+divisible by chunk size, monotonically non-decreasing "now X backed up"
+across a session for any given request).
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -963,7 +963,10 @@
+             "VRAM",
+             num_hit_tokens // chunk_tokens if chunk_tokens else 0,
+             num_hit_tokens,
+-            note=f"GPU had {num_computed_tokens} tok",
++            note=(
++                f"had {num_computed_tokens} tok, now "
++                f"{num_computed_tokens + num_hit_tokens} tok in VRAM"
++            ),
+         )
+ 
+         return num_hit_tokens
+@@ -1367,22 +1370,31 @@
+ 
+             keys_to_store = set(store_output.keys_to_store)
+ 
+-            # First leg of the offload: GPU -> primary (RAM). The cascade on to
+-            # any secondary tier is logged separately by the tiering manager as
+-            # "RAM -> <tier>", so a block that ends up on NVMe produces two
+-            # lines here too, mirroring the two-line LOAD path.
++            # First leg of the offload: GPU -> primary (RAM) -- this is a
++            # COPY, not an eviction: the source blocks stay resident in VRAM
++            # (they're what makes them "storable" at all), this only gives
++            # them a backup on the RAM tier for future restore. The cascade
++            # on to any secondary tier is logged separately by the tiering
++            # manager as "RAM -> <tier>", so a block that ends up on NVMe
++            # produces two lines here too, mirroring the two-line LOAD path.
+             #
+-            # keys_to_store spans all KV groups (3 mamba + 1 full-attention
+-            # here), so the block column counts per-group blocks while the token
+-            # column is the request-level span they cover -- they are not
+-            # meant to divide into each other.
+-            log_kv_transfer(
+-                "STORE",
+-                req.request_id,
+-                "VRAM",
+-                "RAM",
+-                len(keys_to_store),
+-                num_offloadable_tokens,
++            # request-logging readability fix: keys_to_store spans all KV
++            # groups (3 mamba + 1 full-attention here) with potentially
++            # different per-group progress, so a per-transfer token count
++            # can't just be "len(keys_to_store) * chunk size" (that would
++            # double up across groups) or num_offloadable_tokens (that's the
++            # request's whole computed-so-far frontier, not what this
++            # specific store moved -- reported alone it reads as "53248
++            # tokens transferred" when the transfer was 4 blocks). Track the
++            # actual delta via each group's next_stored_chunk_idx, the same
++            # bookkeeping the loop below already advances: the MIN across
++            # groups is the boundary a restore can actually rely on (the
++            # same "shortest group wins" reasoning as HIT_DIVERGED
++            # elsewhere), before vs. after this round's advance.
++            chunk_tokens = self._log_chunk_tokens
++            before_stored_tok = (
++                min(gs.next_stored_chunk_idx for gs in req_status.group_states)
++                * chunk_tokens
+             )
+ 
+             group_sizes: list[int] = []
+@@ -1435,6 +1447,25 @@
+                     group_state.next_stored_chunk_idx, num_chunks
+                 )
+ 
++            after_stored_tok = (
++                min(gs.next_stored_chunk_idx for gs in req_status.group_states)
++                * chunk_tokens
++            )
++            log_kv_transfer(
++                "STORE",
++                req.request_id,
++                "VRAM",
++                "RAM",
++                len(keys_to_store),
++                after_stored_tok - before_stored_tok if chunk_tokens else None,
++                note=(
++                    f"now {after_stored_tok} tok backed up in RAM, "
++                    f"{num_tokens_after_batch} tok in VRAM"
++                    if chunk_tokens
++                    else ""
++                ),
++            )
++
+             src_spec = GPULoadStoreSpec(
+                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
+             )
+--- a/v1/kv_offload/transfer_log.py
++++ b/v1/kv_offload/transfer_log.py
+@@ -11,10 +11,18 @@
+ This module emits one INFO line per transfer, interspersed in the normal log:
+ 
+     KV LOAD  chatcmpl-a9b273614cd4c815 | fs   -> RAM  |  44 blk
+-    KV LOAD  chatcmpl-a9b273614cd4c815 | RAM  -> VRAM |  44 blk /  36608 tok (GPU had 50752 tok)
+-    KV STORE chatcmpl-b88083b7827488ae | VRAM -> RAM  |  12 blk /   9984 tok
++    KV LOAD  chatcmpl-a9b273614cd4c815 | RAM  -> VRAM |  44 blk /  36608 tok (had 50752 tok, now 87360 tok in VRAM)
++    KV STORE chatcmpl-b88083b7827488ae | VRAM -> RAM  |  12 blk /   9984 tok (now 39936 tok backed up in RAM, 39936 tok in VRAM)
+     KV STORE chatcmpl-b88083b7827488ae | RAM  -> fs   |  12 blk
+ 
++A STORE is a copy, not an eviction -- the source blocks stay resident in
++VRAM (that's what makes them storable at all), it only gives them a
++backup on a lower tier. The "now ... tok" figures track that: the RAM
++figure is this request's actual backed-up-so-far boundary (the minimum
++across KV-cache groups, since a hybrid model's groups can progress at
++different rates -- the same reasoning the HIT_DIVERGED rescue uses
++elsewhere), and the VRAM figure never drops on a STORE line.
++
+ A full disk-backed resume therefore reads top to bottom as
+ ``fs -> RAM`` then ``RAM -> VRAM``, which is the staged promotion the tiering
+ manager actually performs (secondary tiers cannot touch GPU memory directly).

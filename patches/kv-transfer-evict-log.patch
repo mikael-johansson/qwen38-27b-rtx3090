@@ -1,0 +1,288 @@
+Add: readable "KV EVICT" logging for VRAM and RAM tier reclaims,
+completing the LOAD/STORE picture in v1/kv_offload/transfer_log.py
+(patches/kv-transfer-request-logging.patch,
+patches/kv-transfer-log-clarity.patch) with the third leg of the KV
+lifecycle: when content actually leaves a tier, not just when it moves
+between tiers.
+
+Requested directly: watching KV LOAD/STORE lines answers "did this
+request's context come off the disk" but not "did an earlier
+conversation's context get reclaimed to make room" -- the user wants to
+know when a conversation is (partially or fully) evicted from VRAM
+(should already be backed up in RAM) or from RAM (should already be on
+a secondary tier/disk if one is configured).
+
+Two real reclaim points, both already existed and already had *some*
+telemetry (a DEBUG log line at one, an opt-in KVCacheEvent/
+OffloadingEvent sink at both) but nothing readable at INFO:
+
+1. VRAM: v1/core/block_pool.py's `_maybe_evict_cached_block()`, called
+   from `get_new_blocks()` (new allocation reclaiming a free-listed,
+   previously-cached block) and `evict_blocks()` (explicit connector-
+   driven invalidation). This is genuinely request-agnostic: prefix-cache
+   blocks are content-addressed and can be shared by multiple
+   conversations with the same prefix, so there is no single "owning
+   request" to attribute a reclaim to in general -- reported as "-",
+   matching transfer_log.py's own docstring, which already anticipated
+   this ("Evictions may not have one; pass '-'").
+
+2. RAM: v1/kv_offload/cpu/manager.py's `prepare_store()`, where
+   `to_evict` (blocks the LRU/ARC eviction policy reclaims to make room
+   for an incoming store) is computed. Same content-addressing caveat.
+   By the time a RAM block is evictable here (ref_cnt == 0),
+   TieringOffloadingManager.complete_store()'s cascade-protection has
+   already released it -- meaning any configured secondary (fs) tier
+   already has its own copy, matching the user's stated assumption
+   ("at which point it should already be on disk").
+
+Both reclaim points fire on essentially every reused block during normal
+steady-state operation (not just under memory pressure) -- multiple
+times per scheduling step under sustained load. Logging one line each
+would reintroduce exactly the per-iteration noise problem this same
+session already fixed elsewhere (ITERATION_LOG). Added a small batching
+accumulator (`_EvictAccumulator` in transfer_log.py) instead: each
+reclaim point calls `log_vram_evict()`/`log_ram_evict()` with the count
+from ONE batch (one get_new_blocks()/evict_blocks()/prepare_store()
+call, already naturally batched -- no new hot-path overhead), and the
+accumulator only actually emits a "KV EVICT" line at most once per
+VLLM_KV_EVICT_LOG_INTERVAL_S seconds (default 10, independent of
+VLLM_LOG_STATS_INTERVAL), reporting the window's totals and its real
+elapsed duration. Respects the existing VLLM_KV_TRANSFER_LOG=0 switch
+(no separate on/off toggle -- EVICT is part of the same "watch a live
+server" feature LOAD/STORE already are).
+
+Token counts: VRAM eviction can use BlockPool's own `hash_block_size`
+(the uniform block-size-in-tokens already used for prefix-cache hashing,
+same value truncate_computed_blocks/scheduler.py's `self.block_size`
+represent elsewhere in this codebase) for an exact blocks*block_size
+figure. RAM eviction is blocks-only, no token estimate -- cpu/manager.py
+works in abstract OffloadKey/block terms with no chunk-size knowledge at
+that layer, matching the existing precedent already in this module (the
+"fs -> RAM" staged-promotion leg reports blocks only for the same
+reason).
+
+Sample output:
+
+    KV EVICT -                         | VRAM -> gone |  96 blk /  15360 tok (reclaimed for reuse, last 10.0s)
+    KV EVICT -                         | RAM  -> gone |   6 blk (reclaimed for reuse, last 10.0s)
+
+Verification: syntax-checked (ast.parse), `import
+vllm.v1.core.block_pool` / `import vllm.v1.kv_offload.cpu.manager`
+succeed standalone (no circular-import issue introduced by importing
+transfer_log.py from either), a standalone accumulator smoke test
+(override the interval, call add() below/above threshold, confirm no
+premature flush and a correctly-formatted line with accurate elapsed
+time once it crosses), `verify.sh --no-server` green. Not yet observed
+against live traffic in this session.
+--- a/v1/kv_offload/transfer_log.py
++++ b/v1/kv_offload/transfer_log.py
+@@ -14,6 +14,8 @@
+     KV LOAD  chatcmpl-a9b273614cd4c815 | RAM  -> VRAM |  44 blk /  36608 tok (had 50752 tok, now 87360 tok in VRAM)
+     KV STORE chatcmpl-b88083b7827488ae | VRAM -> RAM  |  12 blk /   9984 tok (now 39936 tok backed up in RAM, 39936 tok in VRAM)
+     KV STORE chatcmpl-b88083b7827488ae | RAM  -> fs   |  12 blk
++    KV EVICT -                         | VRAM -> gone |  96 blk /  15360 tok (reclaimed for reuse, last 10.0s)
++    KV EVICT -                         | RAM  -> gone |   6 blk (reclaimed for reuse, last 10.0s)
+ 
+ A STORE is a copy, not an eviction -- the source blocks stay resident in
+ VRAM (that's what makes them storable at all), it only gives them a
+@@ -23,16 +25,34 @@
+ different rates -- the same reasoning the HIT_DIVERGED rescue uses
+ elsewhere), and the VRAM figure never drops on a STORE line.
+ 
++An EVICT line, by contrast, IS a real removal -- content-addressed cache
++blocks reclaimed for reuse because the tier below them was (assumed)
++already full/protected while any pending backup was in flight (VRAM
++blocks are ref-count-protected until the offloading connector's own
++store has been submitted; RAM blocks are ref-count-protected while a
++secondary-tier cascade is in flight -- see
++patches/offload-flush-protect-running-request-blocks.patch and
++TieringOffloadingManager.complete_store()). EVICT has no single owning
++request -- content-addressed cache blocks can be shared by multiple
++conversations with the same prefix, so it's reported request-agnostic
++("-") and batched: individual block reclaims happen far too often to log
++one line each (every reused block under normal steady-state operation,
++not just under memory pressure), so they're accumulated and flushed at
++most once per VLLM_KV_EVICT_LOG_INTERVAL_S seconds (default 10) -- "last
++Ns" in the line is that window's actual elapsed time, not a fixed tick.
++
+ A full disk-backed resume therefore reads top to bottom as
+ ``fs -> RAM`` then ``RAM -> VRAM``, which is the staged promotion the tiering
+ manager actually performs (secondary tiers cannot touch GPU memory directly).
+ 
+-Set VLLM_KV_TRANSFER_LOG=0 to silence it. It is deliberately INFO and on by
+-default: the whole point is to be visible next to the request log without
+-turning on DEBUG for all of vLLM, which buries it.
++Set VLLM_KV_TRANSFER_LOG=0 to silence it (this silences EVICT lines too).
++It is deliberately INFO and on by default: the whole point is to be
++visible next to the request log without turning on DEBUG for all of
++vLLM, which buries it.
+ """
+ 
+ import os
++import time
+ 
+ from vllm.logger import init_logger
+ 
+@@ -47,6 +67,12 @@
+ # filenames and in the API response, so lines can be grepped against those.
+ _REQ_ID_MAX = 34
+ 
++# How often to flush accumulated EVICT counts, in seconds. Individual block
++# reclaims are far too frequent to log one line each (see _EvictAccumulator
++# below); this bounds how stale the "how much got reclaimed" picture is
++# allowed to get instead.
++_EVICT_LOG_INTERVAL_S = float(os.environ.get("VLLM_KV_EVICT_LOG_INTERVAL_S", "10"))
++
+ 
+ def kv_transfer_log_enabled() -> bool:
+     return _ENABLED
+@@ -92,3 +118,70 @@
+         size,
+         f" ({note})" if note else "",
+     )
++
++
++class _EvictAccumulator:
++    """Batches EVICT counts for one tier and flushes at most once per
++    _EVICT_LOG_INTERVAL_S. Individual block reclaims are request-agnostic
++    (content-addressed) and happen on essentially every reused block in
++    steady-state operation, so logging each one would reintroduce the same
++    per-iteration noise problem this module exists to avoid.
++    """
++
++    def __init__(self, tier: str):
++        self.tier = tier
++        self._blocks = 0
++        self._tokens = 0
++        self._window_start = time.monotonic()
++
++    def add(self, num_blocks: int, num_tokens: int | None = None) -> None:
++        if not _ENABLED or num_blocks <= 0:
++            return
++        self._blocks += num_blocks
++        if num_tokens:
++            self._tokens += num_tokens
++        now = time.monotonic()
++        elapsed = now - self._window_start
++        if elapsed >= _EVICT_LOG_INTERVAL_S:
++            self._flush(elapsed)
++            self._window_start = now
++
++    def _flush(self, elapsed: float) -> None:
++        if self._blocks <= 0:
++            return
++        log_kv_transfer(
++            "EVICT",
++            "-",
++            self.tier,
++            "gone",
++            self._blocks,
++            self._tokens or None,
++            note=f"reclaimed for reuse, last {elapsed:.1f}s",
++        )
++        self._blocks = 0
++        self._tokens = 0
++
++
++_vram_evict_accumulator = _EvictAccumulator("VRAM")
++_ram_evict_accumulator = _EvictAccumulator("RAM")
++
++
++def log_vram_evict(num_blocks: int, num_tokens: int | None = None) -> None:
++    """Record VRAM (GPU prefix-cache) blocks reclaimed for reuse.
++
++    Call with the count from one batch of reclaims (e.g. one
++    BlockPool.get_new_blocks() call) -- accumulation and throttling are
++    handled internally, so this is safe to call as often as reclaims
++    actually happen.
++    """
++    _vram_evict_accumulator.add(num_blocks, num_tokens)
++
++
++def log_ram_evict(num_blocks: int, num_tokens: int | None = None) -> None:
++    """Record RAM (offload primary tier) blocks reclaimed for reuse.
++
++    Call with the count from one batch of reclaims (e.g. one
++    OffloadingManager.prepare_store() call) -- accumulation and throttling
++    are handled internally.
++    """
++    _ram_evict_accumulator.add(num_blocks, num_tokens)
+--- a/v1/core/block_pool.py
++++ b/v1/core/block_pool.py
+@@ -12,6 +12,7 @@
+ )
+ from vllm.logger import init_logger
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
++from vllm.v1.kv_offload.transfer_log import log_vram_evict
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
+     BlockHashWithGroupId,
+@@ -662,12 +663,22 @@
+ 
+         # In order to only iterate the list once, we duplicated code a bit
+         if self.enable_caching:
++            num_evicted = 0
+             for block in ret:
+-                self._maybe_evict_cached_block(block)
++                if self._maybe_evict_cached_block(block):
++                    num_evicted += 1
+                 assert block.ref_cnt == 0
+                 block.ref_cnt += 1
+                 if self.metrics_collector:
+                     self.metrics_collector.on_block_allocated(block)
++            # request-logging: readable, request-agnostic VRAM eviction
++            # visibility (batched/throttled internally -- see
++            # v1/kv_offload/transfer_log.py's _EvictAccumulator). Every
++            # reused block that HELD real cached content is a reclaim of
++            # someone's context; individually too frequent to log (this is
++            # steady-state behavior, not an anomaly), so this only feeds
++            # the accumulator -- it prints on its own schedule.
++            log_vram_evict(num_evicted, num_evicted * self.hash_block_size)
+         else:
+             for block in ret:
+                 assert block.ref_cnt == 0
+@@ -772,6 +783,7 @@
+         Args:
+             block_ids: Set of block IDs to evict from cache.
+         """
++        num_evicted = 0
+         for block_id in block_ids:
+             assert block_id < len(self.blocks), (
+                 f"Invalid block_id {block_id} >= {len(self.blocks)}. "
+@@ -779,7 +791,9 @@
+                 f"only report block IDs that were allocated by the scheduler."
+             )
+             block = self.blocks[block_id]
+-            self._maybe_evict_cached_block(block)
++            if self._maybe_evict_cached_block(block):
++                num_evicted += 1
++        log_vram_evict(num_evicted, num_evicted * self.hash_block_size)
+ 
+     def reset_prefix_cache(self) -> bool:
+         """Reset prefix cache. This function may be used in RLHF
+--- a/v1/kv_offload/cpu/manager.py
++++ b/v1/kv_offload/cpu/manager.py
+@@ -23,6 +23,7 @@
+     CPULoadStoreSpec,
+     CPUOffloadingMetrics,
+ )
++from vllm.v1.kv_offload.transfer_log import log_ram_evict
+ from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
+ from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+ 
+@@ -216,6 +217,15 @@
+                     removed=True,
+                 )
+             )
++        # request-logging: readable, request-agnostic RAM eviction
++        # visibility, independent of whether an events sink is configured
++        # above -- batched/throttled internally (v1/kv_offload/
++        # transfer_log.py's _EvictAccumulator). By the time a block here is
++        # evictable (ref_cnt == 0), any secondary-tier cascade for it has
++        # already completed (TieringOffloadingManager.complete_store()
++        # ref-count-protects a block for the duration of that cascade), so
++        # it should already be backed up on a lower tier if one exists.
++        log_ram_evict(len(to_evict))
+ 
+         blocks = self._allocate_blocks(keys_to_store)
+         assert len(blocks) == len(keys_to_store), (
