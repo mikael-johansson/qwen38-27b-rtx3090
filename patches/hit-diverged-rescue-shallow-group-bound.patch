@@ -1,0 +1,102 @@
+Fix: HIT_DIVERGED boundary-rescue could call truncate_computed_blocks with a
+retry boundary deeper than a lagging group's actual locally cached hit,
+crashing the engine (`AssertionError: assert num_blocks <= len(group_blocks)`
+in v1/core/kv_cache_manager.py's truncate_computed_blocks).
+
+Found in production: server ran a real deployment (both restore-corruption
+fixes applied -- kv-offload-restore-mamba-conv-spec-reserve.patch,
+kv-offload-store-optimistic-completed-tokens.patch) for ~30 minutes of
+multiple simultaneous conversations, then hit this assertion and crashed
+the EngineCore. This patch is a fix to the pre-existing
+hit-diverged-boundary-rescue.patch's rescue mechanism, found and fixed
+in the same investigation (RESTORE_CORRUPTION_PLAN*.md /
+RESULTS-restore-corruption-*.md) but is NOT one of that investigation's
+two corruption bugs and is unrelated to either of their root causes --
+it is a distinct, pre-existing logic bug in the rescue path itself,
+newly exposed by longer/heavier real-world multi-conversation load
+than this deployment had previously sustained.
+
+Root cause: `get_computed_blocks_for_connector` (v1/core/kv_cache_manager.py)
+populates `new_computed_blocks` from `find_longest_cache_hit_per_group`,
+which fills each KV-cache-group's block list to THAT group's own local hit
+depth -- not padded to the deepest group's depth. For a hybrid Mamba+
+attention model, a lagging group's list (typically Mamba's single running
+checkpoint) can therefore be genuinely shorter than the full-attention
+group's. When full-attention's hit is deeper than a lagging group's
+(`hit_diverged`) and the connector finds no external tokens at the
+attention-based boundary, the existing rescue in v1/core/sched/scheduler.py
+(`schedule()`) re-queries the connector ONE align-size chunk (832 tokens)
+below the attention boundary and, on success, truncates ALL groups'
+locally cached blocks to that retry boundary via `truncate_computed_blocks`.
+That rescue distance -- exactly one align-size chunk -- assumes the
+lagging group is never more than one chunk behind full attention. Under
+sustained eviction pressure (long-running, multiple concurrent
+conversations competing for GPU-resident blocks) a lagging group's hit
+can fall more than one chunk behind, so the one-chunk-down retry boundary
+still exceeds that group's own cached block-list length, and
+truncate_computed_blocks's `assert num_blocks <= len(group_blocks)` fires
+for that group, crashing the engine.
+
+Fix: before computing the retry boundary, compute the shortest group's
+own locally cached depth directly from `new_computed_blocks.blocks`
+(`min(len(group_blocks) for group_blocks in new_computed_blocks.blocks)
+* self.block_size`, floored to the nearest align-size chunk) and cap the
+one-chunk-down retry boundary at that value. This is a pure narrowing: it
+never asks the connector or `truncate_computed_blocks` for a boundary
+deeper than what a diverged group can actually support. If the true
+shallowest group is more than one chunk behind, `retry_local` now comes
+out <= 0 and the existing "not rescued" fallback (full reconcile via
+`get_computed_blocks()`, discarding down to the boundary every group
+agrees on, with its existing WARNING log) takes over -- exactly the same
+safe fallback already used when the connector's retry lookup itself
+fails. No HIT_DIVERGED safety semantics are weakened: a rescue is now
+attempted only when it can structurally succeed, and the fallback path
+that already exists for "the tier genuinely can't back the boundary" is
+reused unchanged for "the local blocks genuinely can't back the
+boundary" too.
+
+Verification: syntax-checked (`ast.parse`), `verify.sh --no-server`
+green (all patches apply). NOT yet re-verified under sustained
+multi-conversation production load (the exact condition that exposed
+the bug) -- next restart should watch for another
+`HIT_DIVERGED RESCUED`/`HIT_DIVERGED RECONCILE` log line (both now
+expected instead of a crash) if the same divergence recurs.
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -844,10 +844,34 @@
+                                 # aligned to every group's block size.
+                                 and align_size % self.block_size == 0
+                             ):
+-                                retry_local = (
++                                # Stepping down by exactly one align-size chunk
++                                # from the deepest (attention) boundary is only
++                                # safe when every diverged group's own local
++                                # hit is no more than one chunk shallower.
++                                # Under sustained eviction pressure a lagging
++                                # group (e.g. Mamba's single-checkpoint state)
++                                # can lag by MORE than one chunk -- its entry
++                                # in `new_computed_blocks` (populated per-group
++                                # by find_longest_cache_hit_per_group) is then
++                                # shorter than one chunk down from
++                                # block_aligned_local, and truncate_computed_
++                                # blocks below would assert. Cap the retry
++                                # boundary at the shortest group's own locally
++                                # cached depth so it never asks for more than
++                                # that group actually has.
++                                min_group_tokens = (
++                                    min(
++                                        len(group_blocks)
++                                        for group_blocks in new_computed_blocks.blocks
++                                    )
++                                    * self.block_size
++                                )
++                                retry_local = min(
+                                     block_aligned_local
+                                     - block_aligned_local % align_size
+-                                    - align_size
++                                    - align_size,
++                                    min_group_tokens
++                                    - min_group_tokens % align_size,
+                                 )
+                                 if retry_local > 0:
+                                     # Safe to repeat: get_num_new_matched_tokens
