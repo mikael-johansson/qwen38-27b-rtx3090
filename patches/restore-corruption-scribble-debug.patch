@@ -45,7 +45,7 @@ qwen.log` shows one line per KV-cache layer plus a summary line at
 startup, before any request is served.
 
 --- a/v1/worker/gpu_model_runner.py	2026-08-24 12:54:21.501683412 +0000
-+++ b/v1/worker/gpu_model_runner.py	2026-08-24 13:56:33.699956284 +0000
++++ b/v1/worker/gpu_model_runner.py	2026-08-24 16:09:56.213564747 +0000
 @@ -4,6 +4,7 @@
  import functools
  import gc
@@ -54,7 +54,7 @@ startup, before any request is served.
  import threading
  import time
  from collections import defaultdict
-@@ -254,6 +255,76 @@
+@@ -254,6 +255,97 @@
  # list when ubatching is enabled
  PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
  
@@ -101,29 +101,50 @@ startup, before any request is served.
 +        target = attn_layers if isinstance(spec, FullAttentionSpec) else mamba_layers
 +        target.update(group.layer_names)
 +
++    # When a selector narrows scribbling to one side of the attn/mamba
++    # split, the OTHER side must be forced to a known-clean zero baseline
++    # first -- GPU memory is not reliably fresh across repeated process
++    # restarts within one investigation session (confirmed
++    # RESULTS-restore-corruption-3.md and again this session: a "mamba
++    # only" scribble run showed stray scribble-pattern bytes surviving in
++    # *attention*'s chunk 0, inherited from an earlier test's leftover GPU
++    # memory, not from this run's own scribbling). Without this, a
++    # selector test's "clean" side isn't actually guaranteed clean, and a
++    # corrupt result can't be trusted to mean what the selector claims.
 +    total_bytes = 0
 +    scribbled_layers = 0
++    zeroed_layers = 0
 +    for layer_name, tensor in kv_caches.items():
-+        if _SCRIBBLE_KV_ONLY == "attn" and layer_name not in attn_layers:
-+            continue
-+        if _SCRIBBLE_KV_ONLY == "mamba" and layer_name not in mamba_layers:
-+            continue
++        in_attn = layer_name in attn_layers
++        selected = (
++            _SCRIBBLE_KV_ONLY == "attn"
++            and in_attn
++            or _SCRIBBLE_KV_ONLY == "mamba"
++            and not in_attn
++            or not _SCRIBBLE_KV_ONLY
++        )
 +        byte_view = tensor.view(torch.uint8)
-+        byte_view.fill_(pattern)
-+        total_bytes += byte_view.numel()
-+        scribbled_layers += 1
++        if selected:
++            byte_view.fill_(pattern)
++            total_bytes += byte_view.numel()
++            scribbled_layers += 1
++        elif _SCRIBBLE_KV_ONLY:
++            byte_view.zero_()
++            zeroed_layers += 1
 +        logger.info(
-+            "SCRIBBLE_KV layer=%s group=%s shape=%s pattern=0x%02x bytes=%d",
++            "SCRIBBLE_KV layer=%s group=%s shape=%s action=%s bytes=%d",
 +            layer_name,
-+            "attn" if layer_name in attn_layers else "mamba",
++            "attn" if in_attn else "mamba",
 +            tuple(tensor.shape),
-+            pattern,
++            f"pattern=0x{pattern:02x}" if selected else ("zeroed" if _SCRIBBLE_KV_ONLY else "pattern"),
 +            byte_view.numel(),
 +        )
 +    logger.info(
-+        "SCRIBBLE_KV done: %d layers, %d bytes, pattern=0x%02x, only=%s",
++        "SCRIBBLE_KV done: %d layers scribbled (%d bytes), %d layers force-zeroed, "
++        "pattern=0x%02x, only=%s",
 +        scribbled_layers,
 +        total_bytes,
++        zeroed_layers,
 +        pattern,
 +        _SCRIBBLE_KV_ONLY or "all",
 +    )
@@ -131,7 +152,7 @@ startup, before any request is served.
  
  # Wrapper for ModelRunnerOutput to support overlapped execution.
  class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
-@@ -7659,6 +7730,7 @@
+@@ -7659,6 +7751,7 @@
          kv_caches = self.initialize_kv_cache_tensors(
              kv_cache_config, kernel_block_sizes
          )

@@ -1,0 +1,75 @@
+Fix (Bug 2): KV-offload restore corruption -- a request's very first
+offloaded chunk (chunk 0) could be marked storable using tokens that
+have not been computed yet, and the existing "defer store submission to
+next-step-begin" safety net does not retroactively fix a storability
+*decision* that was already wrong when made.
+
+Full investigation: RESTORE_CORRUPTION_PLAN.md through PLAN5.md,
+RESULTS-restore-corruption.md through -5.md (this patch's own session).
+This closes plan 1 Sec.3's previously-documented "optimistic storability
+across spec-decode boundaries" defect and, empirically (session 5), the
+separate "chunk 0 stored entirely unwritten" anomaly found in session 4 --
+scan_kv_chunks.py confirmed only ONE chunk in an entire two-conversation
+session showed the anomaly: the session's first-ever store job, not each
+conversation's own first chunk, pointing at a store-timing/ordering bug
+tied to a request's first-ever scheduling step specifically.
+
+Root cause: `_build_store_jobs()`
+(distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py) computed
+`num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens`
+for any non-finished request -- including THIS step's num_scheduled_tokens,
+whose forward output does not exist yet at the point this scheduler-side
+function runs (before that step's compute is even enqueued). The deferred
+store-submission mechanism (`prepare_store_kv` -> `_unsubmitted_store_jobs`
+-> `start_kv_transfers`, confirmed correct in earlier sessions) only
+guarantees the *copy* waits for whatever was already enqueued on the
+compute stream by the time the copy is submitted -- it says nothing about
+whether the chunk was correctly judged *storable* in the first place. For
+a request's first-ever scheduling step, "num_computed_tokens +
+num_scheduled_tokens" reaching a full chunk boundary was treated
+identically to every later, already-warm step, even though nothing about
+that first chunk's content has been computed by any prior step.
+
+Fix: drop `+ num_scheduled_tokens` from the non-finished branch --
+storability is now judged purely on `req.num_computed_tokens` (tokens
+whose forward output is already known-complete from a prior step). This
+delays each chunk's own eligibility decision by one step; combined with
+the existing next-step-begin submission defer, a chunk's content is
+guaranteed to exist, verified, before its store job is even created, let
+alone submitted. The `FINISHED_ABORTED` and `is_finished()` branches are
+unchanged (already based on final, fully-verified token counts).
+
+Verification: see RESULTS-restore-corruption-5.md for the full gate
+results run against this patch (byte-scan re-verification that chunk 0's
+store is no longer captured unwritten, plus the full star-gate/regression
+battery).
+
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-08-24 16:40:28.811582891 +0000
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-08-24 16:40:08.722822147 +0000
+@@ -1234,8 +1234,24 @@
+             elif req.is_finished():
+                 num_tokens_after_batch = req.num_tokens
+             else:
+-                num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-                num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
++                # request-logging fix (RESTORE_CORRUPTION_PLAN5.md /
++                # RESULTS-restore-corruption-5.md, and plan 1 Sec.3's
++                # optimistic-storability defect): do NOT count this step's
++                # num_scheduled_tokens here -- those tokens' forward output
++                # does not exist yet at scheduling time (this runs before
++                # the step's own compute is even enqueued). The deferred
++                # store-submission-at-next-step-begin mechanism only
++                # protects a chunk whose *storability decision* was already
++                # correct when made; it does not retroactively fix a
++                # decision that counted not-yet-computed tokens. Using only
++                # already-computed tokens delays each chunk's eligibility
++                # by one step (matching the existing submission defer, for
++                # a total of two full steps' margin) but guarantees the
++                # decision itself never assumes content that doesn't exist
++                # yet -- including a request's very first chunk, whose
++                # first-ever scheduling step this branch previously treated
++                # identically to every later, already-warm step.
++                num_tokens_after_batch = req.num_computed_tokens
+ 
+             num_offloadable_tokens = self._calc_num_offloadable_tokens(
+                 req_status, num_tokens_after_batch
