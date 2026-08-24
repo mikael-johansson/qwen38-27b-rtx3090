@@ -1,0 +1,223 @@
+Partial fix (confirmed real, confirmed INSUFFICIENT ALONE -- see
+RESULTS-restore-corruption-4.md): the Mamba/GDN conv-state window's
+reserved speculative-decode rows carry stale, uninitialized bytes into
+offloaded checkpoints. This closes that specific gap, verified by direct
+byte-scan of stored chunks (the previously-universal ~61KB scribble-
+survival signature in every Mamba layer is now gone). It does NOT by
+itself close `test_kv_cache_identity_corruption.py`'s repro -- the
+scribble star-gate test (RESTORE_CORRUPTION_PLAN4.md) still corrupts
+after this patch. A second, separate unwritten-region bug (a request's
+very first offloaded chunk, across ALL groups including attention, not
+just Mamba) is documented as the likely remaining cause in
+RESULTS-restore-corruption-4.md's Anomalies section -- not yet fixed.
+Keep this patch (it is a correct, verified fix for the bug it targets)
+but do not mark the overall restore-corruption investigation closed on
+its account alone.
+
+Full investigation across four sessions: RESTORE_CORRUPTION_PLAN.md
+through PLAN4.md, RESULTS-restore-corruption.md through -4.md (this
+patch's own session). Repro: `venv/bin/python
+test_kv_cache_identity_corruption.py --convs 3 --rounds 2` (a conversation
+primed alongside another, then evicted and restored, decodes token soup
+from the first token; deterministic).
+
+Root cause, verified by direct byte-scan of stored offload chunks
+(scan_kv_chunks.py) and code trace (v1/worker/mamba_utils.py,
+model_executor/layers/mamba/mamba_utils.py):
+
+Each Mamba/GDN ("linear_attn") layer's per-block conv-state tensor has
+`conv_kernel_size - 1 + num_speculative_blocks` window rows
+(MambaStateShapeCalculator.gated_delta_net_state_shape) -- for this
+deployment (conv_kernel_size=4, 3 MTP draft tokens), 6 rows: 3 "confirmed"
+history rows plus 3 reserved for draft-token conv history during
+decode-time speculative verification. preprocess_mamba's boundary-
+crossing precopy (the `_copy_mamba_state_block` conv branch,
+`state[dst, :conv_width - token_bias]`) is a *copy*, not a fresh write:
+during plain prefill `accept_token_bias` is always 0 (reset to 1 after
+every crossing, `num_accepted_tokens_cpu[i] = 1`), so the copy width
+covers the *entire* window including the 3 reserved rows -- but it only
+ever carries forward whatever the source block already held there.
+Nothing, anywhere in the prefill path, ever writes fresh data into those
+rows; they are simply propagated block-to-block, chunk to chunk, all the
+way back to a request's very first block, whose reserved rows are exactly
+whatever that physical GPU block's allocation happened to contain: zero
+on a virgin (CUDA-zeroed) page, or a *different, unrelated conversation's*
+stale conv-window bytes on a block recycled from the pool.
+
+Confirmed directly:
+- scan_kv_chunks.py, run against a stored chunk file from an isolated
+  (uncontended) priming with every KV-cache tensor deliberately filled
+  with a nonzero pattern right after allocation
+  (patches/restore-corruption-scribble-debug.patch,
+  VLLM_DEBUG_SCRIBBLE_KV=big): every one of 48 Mamba layer instances (3
+  groups x 16 layers) shows the scribble pattern surviving at byte offset
+  61,440, length 61,440 -- exactly the last 3 of the 6 conv-window rows
+  (3 rows x 10,240 elements x 2 bytes/bfloat16 = 61,440 bytes) -- in every
+  chunk except the very first. The attention group (17 layers, including
+  the MTP drafter's own `mtp.layers.0.self_attn.attn`) shows zero
+  surviving bytes: fully written, not implicated.
+- Control: the same scan against an *unscribbled* isolated priming's
+  stored chunks reads exactly that same byte range as zero, confirming
+  it is genuinely never written, not an artifact of the scribble
+  methodology.
+- Since a conversation primed entirely alone (nothing else ever sharing
+  the GPU pool) always restores clean, while the identical conversation
+  primed alongside others reliably corrupts on restore (four sessions of
+  A/B testing, RESULTS-restore-corruption.md through -3.md), the
+  mechanism is exactly this: c0-on-an-empty-pool's reserved rows are
+  zero (harmless); a later conversation's reserved rows inherit a
+  recycled block's stale bytes from whichever conversation used that
+  physical block before (harmful) -- deterministic garbage in,
+  deterministic token-soup out, matching the byte-identical corrupted
+  output observed run after run, session after session, for the same
+  conversation content.
+
+Not H-MTP (RESTORE_CORRUPTION_PLAN4.md's leading hypothesis going in):
+the MTP draft attention layer's own KV is fully written, every chunk,
+every layer -- ruled out by the same scan. Also not a data-movement bug:
+RESULTS-restore-corruption.md/-2.md already established the stored bytes
+travel store -> RAM -> load -> GPU-read byte-faithfully, for both clean
+and corrupted restores; this patch closes the remaining gap -- the bytes
+being faithfully carried were wrong from the moment of capture, and this
+is why.
+
+Fix: `_zero_conv_speculative_reserve()` in `preprocess_mamba()`
+(v1/worker/mamba_utils.py) explicitly zeros the trailing
+`num_speculative_blocks` conv-window rows of the *destination* block on
+every boundary-crossing precopy -- the one point every block passes
+through before becoming "the current checkpoint," whether freshly
+allocated or recycled from the pool. This makes the content
+deterministic (matching the already-proven-safe virgin-page behavior)
+regardless of the physical block's history, for every group with
+`num_speculative_blocks > 0` (a no-op otherwise -- no reserved rows
+exist without a draft config). Safe during genuine decode-time
+speculation: the reserved rows are pure scratch *output* for the current
+step's forward pass (each draft position's conv state is computed
+sequentially, within that same step, from the confirmed rows plus this
+step's own draft tokens -- never read as input before this step writes
+it), so zeroing them immediately beforehand cannot destroy anything the
+kernel depends on.
+
+Verification: see RESULTS-restore-corruption-4.md for the full gate
+results run against this patch.
+--- a/v1/worker/mamba_utils.py	2026-08-24 15:00:08.984392599 +0000
++++ b/v1/worker/mamba_utils.py	2026-08-24 15:36:52.554523714 +0000
+@@ -1106,6 +1106,74 @@
+             )
+ 
+ 
++def _zero_conv_speculative_reserve(
++    mamba_group_ids: list[int],
++    num_speculative_blocks: int,
++    dest_block_idx: int,
++    kv_cache_config: KVCacheConfig,
++    mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
++    req_state: CachedRequestState,
++    forward_context: dict[str, Any],
++) -> None:
++    """Fix for the KV-offload restore-corruption bug (docs/kv-offload-
++    cache-identity-corruption.md, RESTORE_CORRUPTION_PLAN4.md).
++
++    The conv-state window has `conv_kernel_size - 1 + num_speculative_blocks`
++    rows (get_state_shape() / MambaStateShapeCalculator.gated_delta_net_
++    state_shape); the trailing `num_speculative_blocks` rows exist to hold
++    draft-token conv history during decode-time speculative verification.
++    Verified by direct byte-scan (scan_kv_chunks.py) and code trace: during
++    plain prefill nothing ever writes those rows. preprocess_mamba's own
++    precopy (above) is a *copy* -- at token_bias=0 (the prefill case) it
++    covers the full window including these rows, but it only ever carries
++    forward whatever the source block already had. A request's very first
++    block's reserved rows are therefore whatever that physical block's
++    allocation happened to hold: zero on a virgin GPU page (harmless, and
++    why locally-resident conversations and c0-on-an-empty-pool never showed
++    this), a *different, unrelated conversation's* stale conv history on a
++    block recycled from the pool (not harmless -- confirmed by the
++    VLLM_DEBUG_SCRIBBLE_KV scribble test: filling every KV-cache tensor
++    with garbage right after allocation turned a previously always-clean
++    isolated-priming-then-restore into a reliably corrupted one). That
++    stale content silently rides along into any offloaded checkpoint and
++    corrupts the very first decode step of whatever request later restores
++    it, deterministically (same stale bytes in, same garbled tokens out).
++
++    Zeroing here -- the one point every block passes through before
++    becoming "the current checkpoint," whether freshly allocated or
++    recycled -- makes the content deterministic (matching the already-
++    proven-safe virgin-page behavior) regardless of the physical block's
++    history. Safe during genuine decode-time speculation too: the reserved
++    rows are pure scratch *output* for the current step's forward pass --
++    each draft position's conv state is computed sequentially within that
++    same step from the confirmed rows plus this step's own draft tokens,
++    never read as input before this step writes it. Zeroing them
++    immediately before the forward pass runs cannot destroy anything the
++    kernel depends on.
++
++    No-op when num_speculative_blocks == 0 (no MTP/EAGLE draft config):
++    the conv window then has no reserved rows at all.
++    """
++    for gid in mamba_group_ids:
++        block_ids = req_state.block_ids[gid]
++        if dest_block_idx >= len(block_ids):
++            continue
++        block_id = block_ids[dest_block_idx]
++        layer_names = kv_cache_config.kv_cache_groups[gid].layer_names
++        for layer_name in layer_names:
++            attention = forward_context.get(layer_name)
++            if attention is None:
++                continue
++            kv_caches: list[torch.Tensor] = attention.kv_cache
++            for state, copy_func in zip(kv_caches, mamba_state_copy_funcs):
++                if copy_func is not get_conv_copy_spec:
++                    continue
++                if is_conv_state_dim_first():
++                    state[block_id, :, -num_speculative_blocks:].zero_()
++                else:
++                    state[block_id, -num_speculative_blocks:, :].zero_()
++
++
+ def preprocess_mamba(
+     scheduler_output: SchedulerOutput,
+     kv_cache_config: KVCacheConfig,
+@@ -1133,6 +1201,7 @@
+ 
+     copy_bufs.offset = 0
+     num_reqs = len(input_batch.req_ids)
++    pending_spec_reserve_zeroing: list[tuple[CachedRequestState, int]] = []
+ 
+     if fused is not None:
+         if num_reqs == 0:
+@@ -1207,6 +1276,8 @@
+                     forward_context,
+                 )
+             input_batch.num_accepted_tokens_cpu[i] = 1
++            if num_speculative_blocks > 0:
++                pending_spec_reserve_zeroing.append((req_state, curr_state_idx))
+ 
+     if fused is not None:
+         fused.state_idx.copy_to_gpu(num_reqs)
+@@ -1222,6 +1293,26 @@
+     else:
+         do_mamba_copy_block(copy_bufs)
+ 
++    # Must run AFTER the precopy dispatch above (fused GPU kernel launch or
++    # do_mamba_copy_block), not interleaved with the per-request staging
++    # loop: the precopy is a *copy from the source block*, so if this ran
++    # before precopy's kernel launch, precopy would simply overwrite this
++    # zeroing with the (possibly still-uninitialized) source content --
++    # silently defeating the fix. See RESTORE_CORRUPTION_PLAN4.md /
++    # RESULTS-restore-corruption-4.md for how this ordering bug was caught
++    # (star-gate scribble test stayed corrupted with the fix seemingly
++    # "applied").
++    for req_state, curr_state_idx in pending_spec_reserve_zeroing:
++        _zero_conv_speculative_reserve(
++            mamba_group_ids,
++            num_speculative_blocks,
++            curr_state_idx,
++            kv_cache_config,
++            mamba_state_copy_funcs,
++            req_state,
++            forward_context,
++        )
++
+ 
+ def postprocess_mamba_all(
+     scheduler_output: SchedulerOutput,
