@@ -1,0 +1,141 @@
+TEMPORARY diagnostic patch, RESTORE_CORRUPTION_PLAN3.md Phase A
+("the scribble test" for the uninitialized-memory / stale-block
+hypothesis). Not meant to ship -- delete once the restore-corruption
+investigation (docs/kv-offload-cache-identity-corruption.md) closes.
+
+Plan 2 established: a corrupted restore's checkpoint bytes are byte-
+faithful all the way from store through load to GPU-read (no data-
+movement bug), yet the exact same conversation's checkpoint restores
+*clean* when it was originally primed with the GPU KV cache pool
+otherwise empty, and *corrupts* when other conversations had previously
+occupied the pool -- and the live (non-restored) reply is always correct
+regardless. Plan 3's hypothesis: the stored checkpoint page contains a
+byte range some write path never touches, and the live compute path never
+reads that range either (so its correctness is unaffected) -- but the
+restore path (which loads and consumes the *entire* stored page) does
+read it. On a virgin GPU allocation that unread range is zero (CUDA
+allocates already-zeroed pages); on a block recycled from a finished
+conversation, it is that conversation's leftover bytes.
+
+This patch adds `VLLM_DEBUG_SCRIBBLE_KV`: when set, every KV-cache tensor
+is filled with a deliberately nonzero byte pattern (0x3C, or 0xFF via
+`VLLM_DEBUG_SCRIBBLE_KV=ff`) immediately after allocation, in
+`GPUModelRunner.initialize_kv_cache()` -- right after
+`initialize_kv_cache_tensors()` returns and before the KV-transfer group
+(offload connector) ever registers or touches them, so every byte in
+every KV-cache tensor is guaranteed nonzero before any request runs. This
+turns "reads a never-written byte" from "silently reads zero" (which a
+virgin CUDA allocation supplies "for free", making a real bug and a
+non-bug indistinguishable) into "detectably reads garbage" -- if the
+hypothesis is right, priming a single, otherwise-uncontended conversation
+against a scribbled pool should now corrupt on restore too, even though
+plan 2's identical recipe against an *unscribbled* pool restored clean
+3/3.
+
+`VLLM_DEBUG_SCRIBBLE_KV_ONLY` (values: "attn", "mamba"; unset = all
+groups) restricts scribbling to one side of the attention/Mamba split,
+for Phase B's field bisection -- classification is by
+`kv_cache_config.kv_cache_groups[i].kv_cache_spec` (FullAttentionSpec vs.
+everything else, i.e. Mamba/GDN's MambaSpec in this deployment).
+
+Verification: applies cleanly (bash verify.sh --no-server); with
+VLLM_DEBUG_SCRIBBLE_KV unset, behavior is unchanged (the hook is a no-op
+gated by `if not _SCRIBBLE_KV: return`). With it set, `grep SCRIBBLE_KV
+qwen.log` shows one line per KV-cache layer plus a summary line at
+startup, before any request is served.
+
+--- a/v1/worker/gpu_model_runner.py	2026-08-24 12:54:21.501683412 +0000
++++ b/v1/worker/gpu_model_runner.py	2026-08-24 13:56:33.699956284 +0000
+@@ -4,6 +4,7 @@
+ import functools
+ import gc
+ import itertools
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -254,6 +255,76 @@
+ # list when ubatching is enabled
+ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+ 
++# TEMPORARY (RESTORE_CORRUPTION_PLAN3.md Phase A): the uninitialized-memory
++# (stale-block) hypothesis test. If set, every freshly-allocated GPU KV
++# cache tensor is filled with a deliberately nonzero byte pattern right
++# after allocation/registration -- before any request ever runs -- so that
++# any byte a copy/write path *fails* to touch before it's later read
++# (either by the live forward pass or, crucially, by a restored request)
++# shows up as detectable non-zero contamination instead of silently
++# reading zeros (which a virgin CUDA allocation would otherwise supply,
++# masking the very bug this test is hunting for). "1" = mild pattern
++# (0x3C, fp16 ~1.06 -- plausible-looking stale data, unlikely to trip a
++# NaN-guard some other code path might have); "ff" = aggressive pattern
++# (0xFF, NaN-heavy in every float dtype in use here) held in reserve for
++# Phase A3 if the mild pattern turns out to be numerically inert.
++# VLLM_DEBUG_SCRIBBLE_KV_ONLY restricts which KV-cache groups get
++# scribbled ("attn" or "mamba"; unset/other = all groups) for Phase B's
++# field bisection. Revert by deleting this patch; not meant to ship.
++_SCRIBBLE_KV = os.environ.get("VLLM_DEBUG_SCRIBBLE_KV")
++_SCRIBBLE_KV_ONLY = os.environ.get("VLLM_DEBUG_SCRIBBLE_KV_ONLY")
++
++
++def _scribble_kv_caches(kv_caches: dict[str, "torch.Tensor"], kv_cache_config) -> None:
++    if not _SCRIBBLE_KV:
++        return
++    # "ff" = 0xFF (NaN in fp16/fp8 -- propagates through any op it touches,
++    # so it can't cleanly separate which *field* has the unwritten region
++    # once corrupted content reaches a shared residual stream). "big" =
++    # 0x7B (fp16 61280.0, finite but huge -- perturbing without the
++    # blanket NaN-propagation confound). default/"1" = 0x3C (mild, numerically
++    # inert in this test).
++    if _SCRIBBLE_KV == "ff":
++        pattern = 0xFF
++    elif _SCRIBBLE_KV == "big":
++        pattern = 0x7B
++    else:
++        pattern = 0x3C
++
++    attn_layers: set[str] = set()
++    mamba_layers: set[str] = set()
++    for group in kv_cache_config.kv_cache_groups:
++        spec = group.kv_cache_spec
++        target = attn_layers if isinstance(spec, FullAttentionSpec) else mamba_layers
++        target.update(group.layer_names)
++
++    total_bytes = 0
++    scribbled_layers = 0
++    for layer_name, tensor in kv_caches.items():
++        if _SCRIBBLE_KV_ONLY == "attn" and layer_name not in attn_layers:
++            continue
++        if _SCRIBBLE_KV_ONLY == "mamba" and layer_name not in mamba_layers:
++            continue
++        byte_view = tensor.view(torch.uint8)
++        byte_view.fill_(pattern)
++        total_bytes += byte_view.numel()
++        scribbled_layers += 1
++        logger.info(
++            "SCRIBBLE_KV layer=%s group=%s shape=%s pattern=0x%02x bytes=%d",
++            layer_name,
++            "attn" if layer_name in attn_layers else "mamba",
++            tuple(tensor.shape),
++            pattern,
++            byte_view.numel(),
++        )
++    logger.info(
++        "SCRIBBLE_KV done: %d layers, %d bytes, pattern=0x%02x, only=%s",
++        scribbled_layers,
++        total_bytes,
++        pattern,
++        _SCRIBBLE_KV_ONLY or "all",
++    )
++
+ 
+ # Wrapper for ModelRunnerOutput to support overlapped execution.
+ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+@@ -7659,6 +7730,7 @@
+         kv_caches = self.initialize_kv_cache_tensors(
+             kv_cache_config, kernel_block_sizes
+         )
++        _scribble_kv_caches(kv_caches, kv_cache_config)
+ 
+         if (
+             self.speculative_config
