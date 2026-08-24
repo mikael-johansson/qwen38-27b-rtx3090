@@ -1,0 +1,158 @@
+Include the Mamba/GDN state layout in the KV offload cache identity.
+
+The offload cache's directory name is a sha256 over FileMapper.fields, and
+that set contained nothing about the recurrent state:
+
+  blocks_per_file, dcp_size, dtype, inference_engine, model_name,
+  kv_cache_groups[{layer_names, tokens_per_block}], parallel_agnostic,
+  pcp_size, pp_size, tokens_per_hash, tp_size
+
+`dtype` there is the ATTENTION KV dtype (fp8 here), not the SSM state dtype.
+So two servers differing only in --mamba-ssm-cache-dtype (or in
+--mamba-cache-mode) hash to the SAME directory, and each will happily load
+the other's blocks and reinterpret the bytes. That is not a cache miss that
+costs a recompute -- it is silent state corruption, and it comes out as
+fluent-looking multilingual token soup or a run of "!!!!!!" from the first
+decoded token, with the request otherwise looking perfectly healthy (high
+cache hit rate, normal timings, no warning anywhere).
+
+This model has 4 KV groups sharing that one directory -- 3 MambaManager
+(48 linear_attn layers total) and 1 FullAttentionManager -- so on a resume
+three quarters of the restored blocks are recurrent state.
+
+Diagnosed 2026-08-24. One cache directory here had accumulated blocks from
+fp16 / bf16 / fp32 runs across several days and several vLLM builds. With a
+2-conversation x 88K-token repro, the conversation that got evicted and
+restored from that directory was garbage 4/4, while the one that stayed
+GPU-resident was always fine. Controls, all with the same full restores
+("GPU had 0 tok"):
+
+  offload disabled                          0/8  garbage (recompute instead)
+  RAM tier only, 5 full restores            0/8
+  NVMe tier, cache cleared first            0/8, 0/16, 0/6
+  NVMe tier, pre-existing mixed-config dir  4/4, 15/24, 18/24
+
+i.e. corruption occurred iff the mixed-config directory was in play, at both
+--long-prefill-token-threshold 512 and 832, with O_DIRECT and with buffered
+I/O. The threshold correlation that first pointed here was exposure, not
+cause: 832 drove 433 offload lookups in one window against 57 at 512, so it
+met a poisoned block far more often.
+
+The two fields are written only when non-empty, following the existing
+`replicated_layout` convention directly above, and they are populated only
+when the model actually has a non-AttentionSpec group. Models with no
+recurrent groups therefore keep their exact current directory hash and do
+not lose their cache to this change. Verified: fp16 and fp32 now hash to
+different directories, cache_mode likewise, the same config is stable across
+runs, and a model with no mamba groups is byte-identical to before.
+
+For a model that does have them this is a one-time cold rebuild -- the old
+directory is simply orphaned and becomes the least-recently-accessed thing
+in root_dir, so patches/fs-tier-disk-cap.patch reclaims it on its own.
+
+Deliberately NOT hashed: the vLLM build/patch set. It would be stricter, but
+it would cost a full cold cache on every patch applied to this repo, which
+is a bad trade for a cache that takes ~65s per 88K-token conversation to
+rebuild. The fields here are the ones that change what the stored bytes MEAN.
+
+diff --git a/distributed/kv_transfer/kv_connector/v1/offloading/config.py b/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+index b9837bc..d38ca36 100644
+--- a/distributed/kv_transfer/kv_connector/v1/offloading/config.py
++++ b/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+@@ -55,6 +55,14 @@ def build_offloading_config(
+         for group in kv_cache_config.kv_cache_groups
+     )
+ 
++    # A group that is not an AttentionSpec carries recurrent (Mamba/GDN) state,
++    # whose on-disk bytes depend on mamba_ssm_cache_dtype / mamba_cache_mode.
++    # Models without such groups keep their existing cache identity untouched.
++    has_recurrent_groups = any(
++        not isinstance(group.kv_cache_spec, AttentionSpec)
++        for group in kv_cache_config.kv_cache_groups
++    )
++
+     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+     for group in groups:
+         assert group.tokens_per_block % tokens_per_hash == 0, (
+@@ -167,6 +175,16 @@ def build_offloading_config(
+         cache=OffloadingCacheConfig(
+             tokens_per_hash=tokens_per_hash,
+             blocks_per_chunk=blocks_per_chunk,
++            mamba_ssm_cache_dtype=(
++                str(vllm_config.cache_config.mamba_ssm_cache_dtype)
++                if has_recurrent_groups
++                else ""
++            ),
++            mamba_cache_mode=(
++                str(vllm_config.cache_config.mamba_cache_mode)
++                if has_recurrent_groups
++                else ""
++            ),
+         ),
+         parallel=OffloadingParallelConfig(
+             rank=parallel_config.rank,
+diff --git a/v1/kv_offload/config.py b/v1/kv_offload/config.py
+index 46ca489..67496b2 100644
+--- a/v1/kv_offload/config.py
++++ b/v1/kv_offload/config.py
+@@ -30,6 +30,13 @@ class OffloadingCacheConfig:
+     tokens_per_hash: int
+     # Blocks coalesced into one offload chunk.
+     blocks_per_chunk: int
++    # Recurrent (Mamba/GDN) state layout, for models that have such groups.
++    # These change what the BYTES of a mamba block mean without changing any
++    # of the other hashed fields, so they must take part in the offload cache
++    # identity -- see FileMapper.__init__. Empty string for models with no
++    # recurrent groups, which keeps their cache directory hash unchanged.
++    mamba_ssm_cache_dtype: str = ""
++    mamba_cache_mode: str = ""
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/v1/kv_offload/file_mapper.py b/v1/kv_offload/file_mapper.py
+index 4b12dba..d2bd96f 100644
+--- a/v1/kv_offload/file_mapper.py
++++ b/v1/kv_offload/file_mapper.py
+@@ -36,6 +36,8 @@ class FileMapper:
+         inference_engine: str = "vllm",
+         parallel_agnostic: bool = False,
+         replicated_layout: bool = False,
++        mamba_ssm_cache_dtype: str = "",
++        mamba_cache_mode: str = "",
+     ):
+         """
+         Initialize the file mapper. Each worker constructs its own, but
+@@ -65,6 +67,24 @@ class FileMapper:
+         # unchanged (False is the historical default and must not appear).
+         if replicated_layout:
+             self.fields["replicated_layout"] = True
++        # Recurrent (Mamba/GDN) state layout. `dtype` above is the ATTENTION KV
++        # dtype only, so without these two a server storing fp16 SSM state and
++        # one storing fp32 SSM state hash to the same directory, and each will
++        # happily load the other's blocks and reinterpret the bytes. That is
++        # not a cache miss -- it is silent state corruption, and it surfaces as
++        # fluent-looking multilingual token soup from the first decoded token.
++        # Diagnosed 2026-08-24: one cache directory had accumulated blocks from
++        # fp16/bf16/fp32 runs over several days; clearing it made a
++        # deterministic 4/4 repro clean, and reusing it reproduced the garbage
++        # at every long-prefill-token-threshold, with and without O_DIRECT.
++        #
++        # Written only when non-empty, following replicated_layout above, so
++        # models with no recurrent groups keep their existing directory hash
++        # and do not lose their cache to this change.
++        if mamba_ssm_cache_dtype:
++            self.fields["mamba_ssm_cache_dtype"] = mamba_ssm_cache_dtype
++        if mamba_cache_mode:
++            self.fields["mamba_cache_mode"] = mamba_cache_mode
+         self.base_path: str = self._compute_base_path(root_dir, self.fields)
+ 
+     @classmethod
+@@ -102,6 +122,8 @@ class FileMapper:
+                 and (parallel.is_parallelism_agnostic or config.replicated_layout)
+             ),
+             replicated_layout=(parallel_agnostic and config.replicated_layout),
++            mamba_ssm_cache_dtype=config.cache.mamba_ssm_cache_dtype,
++            mamba_cache_mode=config.cache.mamba_cache_mode,
+         )
+ 
+     def get_file_name(self, key: OffloadKey) -> str:
