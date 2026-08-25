@@ -1,0 +1,157 @@
+Fix: the HIT_DIVERGED RECONCILE fallback (v1/core/sched/scheduler.py, see
+patches/hit-diverged-reconcile-log-dedup.patch for the log-spam half of
+this same investigation) redid its entire lookup/rescue/reconcile dance
+from scratch on every single scheduler tick for a request stuck waiting
+on GPU memory, not just re-logging identically -- the log-spam patch
+only silenced the symptom. This patch addresses the underlying wasted
+work the user asked to have investigated after the first fix landed.
+
+Root cause: `if request.num_computed_tokens == 0:` gates the entire
+local-lookup + connector round-trip + boundary-rescue + reconcile block,
+and `num_computed_tokens` is only ever set once `allocate_slots()`
+actually succeeds (`request.num_computed_tokens = num_computed_tokens`,
+well below this block). When `allocate_slots()` returns None (no free KV
+blocks -- confirmed from the user's own paste: GPU KV cache usage
+81-99.6%, 3 running + up to 1 waiting/deferred request), the scheduling
+loop `break`s for that step without ever setting num_computed_tokens, so
+the exact same request re-enters this whole block from scratch on the
+very next schedule() call -- roughly every 60-70ms under this
+deployment's MTP spec-decode cadence, observed at 100+ times in under
+ten seconds for one stuck request.
+
+Investigated and ruled out caching the connector's answer directly:
+`OffloadingConnectorScheduler.get_num_new_matched_tokens()` (offloading/
+scheduler.py) has real side effects on every call -- it clears and
+re-derives the request's per-group offload block-id tracking, resets
+`req_status.num_locally_computed_tokens`, and calls `self._touch()`,
+which protects the hit chunks from eviction. Skipping that call on a
+"cached" tick would skip that eviction-protection touch too -- actively
+counterproductive under exactly the memory-pressure conditions that
+cause this stall -- and could leave `req_status`'s internal state stale
+relative to whatever boundary is actually used if allocation succeeds
+right after. So the connector call itself, and the block references
+`get_computed_blocks[_for_connector]` return, are NEVER cached by this
+patch -- every attempt that's actually made still redoes the full,
+correct, freshly-verified dance, side effects included.
+
+Fix instead: back off retrying only once a *complete* dance has already
+run and STILL failed admission right after -- i.e., cut how often the
+dance is attempted, not what it computes when attempted. The reconcile
+branch stamps `request._hit_diverged_reconcile_ts = time.monotonic()`
+the moment it runs (a plain attribute on Request -- not a dataclass
+field, not slotted, so this is safe and self-cleans with the request's
+own lifetime, no separate registry to leak or garbage-collect). At the
+top of the waiting-queue walk, before any lookup work, a request whose
+stamp is younger than VLLM_HIT_DIVERGED_RETRY_COOLDOWN_S (default 0.3s,
+0 disables this entirely) is popped and deferred to step_skipped_waiting
+instead -- the exact same "pop, defer, try the next waiting request"
+pattern the lora/blocked-status/stale-output-token skips just below
+already use in this identical loop, so a smaller request behind it can
+still be scheduled this step, and admission order/fairness semantics are
+unchanged from today's upstream behavior otherwise. If we see this
+request again within the cooldown, it can only be because admission
+failed right after the stamp was set (a successfully-admitted request
+leaves the waiting queue and is never peeked here again), so nothing
+about GPU or offload state could plausibly have changed in between --
+and once the cooldown elapses, the request competes again exactly as
+before, so a genuine change (blocks freed up, an in-flight store
+completes) is never delayed by more than the cooldown.
+
+Net effect: at the default 0.3s cooldown, a multi-second admission stall
+drops from ~15 full dance-repeats/second to ~3/second for the affected
+request -- most of the wasted connector I/O and local reconcile work
+disappears, worst-case added admission latency is bounded at 300ms, and
+HIT_DIVERGED reconcile safety semantics are completely unchanged (same
+tokens discarded, same fallback taken, just attempted less often while
+genuinely blocked on resources rather than data availability).
+
+Verification: syntax-checked (ast.parse), `verify.sh --no-server` green.
+Not yet observed against a live recurrence of the high-contention
+scenario that exposed this.
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -65,6 +66,39 @@
+ 
+ logger = init_logger(__name__)
+ 
++# request-logging efficiency fix: a request stuck in the waiting queue on
++# admission failure (allocate_slots() returns None -- no free KV blocks)
++# re-enters the whole HIT_DIVERGED lookup/rescue/reconcile dance from
++# scratch on every later schedule() call, since num_computed_tokens stays
++# 0 until admission actually succeeds. Under MTP spec-decode that's
++# roughly one retry per ~60-70ms engine step -- observed at 100+ retries
++# in under ten seconds for one request stuck behind a full GPU KV cache.
++# Each retry re-issues the rescue's connector round-trip (a real,
++# possibly disk-backed query -- see offloading/scheduler.py's
++# get_num_new_matched_tokens, which also clears and re-derives per-request
++# offload state as a side effect, so its result can't just be cached and
++# reused) purely to re-confirm the same "not backed" answer, then redoes
++# the local-only reconcile. The reconcile branch stamps a timestamp on
++# the request the moment it runs; if we see that request again at the
++# top of the waiting-queue loop within this cooldown, it can only be
++# because admission failed right after (a successfully-admitted request
++# leaves the waiting queue and is never peeked here again) -- so nothing
++# about GPU/offload state could plausibly have changed in between, and
++# it's deferred instead of repeating the whole dance again this tick.
++# See the timestamp's write site (HIT_DIVERGED reconcile) and read site
++# (top of the waiting-queue walk) below. Matches
++# the same "pop, defer to step_skipped_waiting, try the next waiting
++# request" pattern already used by the lora/blocked-status/stale-output
++# skips in that same loop, so a smaller request behind it still gets a
++# chance this step. A genuine change in resource availability is never
++# delayed by more than this cooldown. Tunable since the right trade-off
++# (wasted work saved vs. worst-case added admission latency) depends on
++# workload; 0 disables the skip entirely (falls back to retrying every
++# tick, i.e. today's upstream behavior).
++_HIT_DIVERGED_RETRY_COOLDOWN_S = float(
++    os.environ.get("VLLM_HIT_DIVERGED_RETRY_COOLDOWN_S", "0.3")
++)
++
+ 
+ class Scheduler(SchedulerInterface):
+     def __init__(
+@@ -697,6 +731,21 @@
+                 request = request_queue.peek_request()
+                 request_id = request.request_id
+ 
++                # request-logging efficiency fix: see
++                # _HIT_DIVERGED_RETRY_COOLDOWN_S above.
++                if _HIT_DIVERGED_RETRY_COOLDOWN_S > 0:
++                    last_reconcile_ts = getattr(
++                        request, "_hit_diverged_reconcile_ts", None
++                    )
++                    if (
++                        last_reconcile_ts is not None
++                        and time.monotonic() - last_reconcile_ts
++                        < _HIT_DIVERGED_RETRY_COOLDOWN_S
++                    ):
++                        request_queue.pop_request()
++                        step_skipped_waiting.prepend_request(request)
++                        continue
++
+                 # try to promote blocked statuses while traversing skipped queue.
+                 if self._is_blocked_waiting_status(
+                     request.status
+@@ -933,6 +982,14 @@
+                                 ) = self.kv_cache_manager.get_computed_blocks(
+                                     request
+                                 )
++                                # request-logging efficiency fix: see
++                                # _HIT_DIVERGED_RETRY_COOLDOWN_S above --
++                                # read at the top of the waiting-queue walk
++                                # to skip repeating this whole dance next
++                                # tick if admission fails right after.
++                                request._hit_diverged_reconcile_ts = (
++                                    time.monotonic()
++                                )
+                                 # WARNING, not debug: this is the one line that
+                                 # says real work was thrown away. It should stay
+                                 # visible under the normal (INFO) logging config

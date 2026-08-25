@@ -1,0 +1,78 @@
+Fix: HIT_DIVERGED RECONCILE WARNING (v1/core/sched/scheduler.py, from
+patches/hit-diverged-boundary-rescue.patch) logged 100+ identical lines
+in under ten seconds for a single request under load -- reported
+directly by the user as alarming log output from production.
+
+Root cause: the whole `if request.num_computed_tokens == 0:` block --
+including the local prefix-cache lookup, the connector round-trip, the
+boundary-rescue retry (patches/hit-diverged-rescue-shallow-group-bound.
+patch), and, when that doesn't pan out, this RECONCILE fallback -- only
+runs while a request's `num_computed_tokens` is still 0. That field is
+only ever set once `allocate_slots()` actually succeeds (scheduler.py,
+`request.num_computed_tokens = num_computed_tokens` a few dozen lines
+below this WARNING). When `allocate_slots()` returns None (no free KV
+blocks -- e.g. GPU KV cache pinned near 100% under concurrent load,
+exactly what the user's paste showed: 81-99.6% usage, 3 running + 1
+waiting/deferred request), the scheduling loop `break`s for this step
+without ever setting num_computed_tokens, so the SAME request re-enters
+this entire block from scratch on the very next schedule() call --
+typically the next engine step, roughly every 60-70ms under MTP
+spec-decode. Since nothing about the connector's backing state changed
+between attempts (same local hit, same external-confirms-0 result), the
+reconcile deterministically discards the identical token count and logs
+the identical WARNING every single retry, purely because the request is
+stuck waiting on GPU memory, not because anything is actually wrong.
+
+Fix: `logger.warning` -> `logger.warning_once`. vLLM's `warning_once`
+dedupes on `(logger, format_string, *args)` via an lru_cache (bounded,
+maxsize=128, so no unbounded growth over a long-running server) -- since
+request_id and both token counts are passed as *args here, this
+collapses only TRUE repeats (same request, same reconciled outcome),
+not the WARNING as a whole: a different request, or this same request
+later reconciling to a genuinely different boundary (e.g. after a
+preemption or once the offload tier's state actually changes), still
+gets logged. This changes ONLY the logging -- the underlying repeated
+recomputation (fresh local lookup + connector round-trip + reconcile)
+still happens every retry; that's a separate, real inefficiency
+(wasted work specifically when the server is already under memory
+pressure, likely contributing to elevated TTFT) that would need a
+higher-risk change to the actual admission/retry path to fix, not
+attempted here -- this patch is scoped to the log-spam symptom the user
+flagged, not a change to scheduling behavior. Ground rule preserved:
+HIT_DIVERGED reconcile safety semantics are completely unchanged --
+same tokens discarded, same fallback taken, just logged once instead of
+every retry.
+
+Verification: syntax-checked (ast.parse), `logger.warning_once` confirmed
+present on vLLM's patched Logger instances, `verify.sh --no-server`
+green. Not yet observed against a live recurrence of this exact
+high-contention scenario.
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -942,7 +942,25 @@
+                                 # boundary-rescue retry above are both in place;
+                                 # if it starts appearing regularly again, that is
+                                 # a genuine regression worth investigating.
+-                                logger.warning(
++                                #
++                                # request-logging spam fix: while this request
++                                # can't be admitted (e.g. GPU KV cache near full
++                                # -- see allocate_slots()'s `new_blocks is None`
++                                # break below, which leaves num_computed_tokens
++                                # at 0 and re-enters this whole block from
++                                # scratch on every later schedule() call), the
++                                # exact same local hit deterministically
++                                # reconciles down to the exact same boundary each
++                                # retry -- observed firing 100+ times in under
++                                # ten seconds for one stuck request under load.
++                                # warning_once dedupes on (format string, *args):
++                                # request_id and both token counts are args, so
++                                # this collapses only true repeats of the same
++                                # outcome for the same request -- a different
++                                # request, or this same request hitting a
++                                # genuinely different reconciled boundary on a
++                                # later attempt, still gets its own line.
++                                logger.warning_once(
+                                     "request-logging: %s HIT_DIVERGED "
+                                     "RECONCILE -- diverged local hit was %d tokens, "
+                                     "external connector confirmed 0, reconciled down "
