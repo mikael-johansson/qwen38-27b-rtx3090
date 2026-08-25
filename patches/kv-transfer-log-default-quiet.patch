@@ -1,0 +1,93 @@
+Fix: KV LOAD/STORE/EVICT lines (v1/kv_offload/transfer_log.py,
+VLLM_KV_TRANSFER_LOG) and the periodic "KV Transfer metrics: ..." line
+(distributed/kv_transfer/kv_connector/v1/metrics.py,
+VLLM_KV_TRANSFER_METRICS_LOG) were both on by default -- too much detail
+for routine watching even after readability fixes, per direct feedback
+listing five example lines still cluttering the default log (RAM->fs
+cascade legs, VRAM->RAM store lines, EVICT lines, and the raw metrics
+dump).
+
+Both switches already existed (this session, kv-transfer-log-clarity.patch
+/ kv-transfer-evict-log.patch / kv-transfer-metrics-log-readability.patch)
+-- this is purely a default flip, no new flag introduced: "1" -> "0" for
+VLLM_KV_TRANSFER_LOG (which already gates all of LOAD, STORE, and EVICT
+-- one switch, not three), and "1" -> "0" for
+VLLM_KV_TRANSFER_METRICS_LOG. Set either to 1 to watch that detail live.
+Neither change touches v1/engine/request_lifecycle_log.py's NEW
+REQUEST/FINISHED lines (VLLM_REQUEST_LIFECYCLE_LOG, still on by
+default) -- those are the per-request summary meant to be the everyday
+default view; this patch demotes only the per-transfer/per-metric detail
+one tier below it, matching the same "default quiet, opt into more"
+shape as the ITERATION_LOG default flip earlier in this session.
+
+Verification: syntax-checked (ast.parse), `verify.sh --no-server` green.
+--- a/v1/kv_offload/transfer_log.py
++++ b/v1/kv_offload/transfer_log.py
+@@ -8,7 +8,13 @@
+ watching a live server -- *did this request's context come off the disk, and
+ how much of it moved?*
+ 
+-This module emits one INFO line per transfer, interspersed in the normal log:
++This is verbose, per-transfer detail -- one block movement or reclaim at a
++time -- one tier below v1/engine/request_lifecycle_log.py's NEW REQUEST/
++FINISHED lines (one per request, on by default). Off by default; set
++VLLM_KV_TRANSFER_LOG=1 to watch it live.
++
++When enabled, this module emits one INFO line per transfer, interspersed
++in the normal log:
+ 
+     KV LOAD  chatcmpl-a9b273614cd4c815 | fs   -> RAM  |  44 blk
+     KV LOAD  chatcmpl-a9b273614cd4c815 | RAM  -> VRAM |  44 blk /  36608 tok (had 50752 tok, now 87360 tok in VRAM)
+@@ -45,10 +51,15 @@
+ ``fs -> RAM`` then ``RAM -> VRAM``, which is the staged promotion the tiering
+ manager actually performs (secondary tiers cannot touch GPU memory directly).
+ 
+-Set VLLM_KV_TRANSFER_LOG=0 to silence it (this silences EVICT lines too).
+-It is deliberately INFO and on by default: the whole point is to be
+-visible next to the request log without turning on DEBUG for all of
+-vLLM, which buries it.
++Set VLLM_KV_TRANSFER_LOG=1 to turn it on (silences to off again with 0 or
++by leaving it unset). Deliberately INFO rather than DEBUG so it's cheap to
++flip on next to the request log without turning on DEBUG for all of vLLM
++(which buries it) -- but off by default: at typical request rates this is
++several lines per request (one per chunk, per tier hop, plus batched
++EVICT lines), which is too much for routine watching. NEW REQUEST/
++FINISHED (v1/engine/request_lifecycle_log.py, on by default) is the
++per-request summary; turn this on when you need the per-transfer detail
++behind it.
+ """
+ 
+ import os
+@@ -59,8 +70,9 @@
+ logger = init_logger(__name__)
+ 
+ # Read once at import. This is a deployment-level switch, not something that
+-# should be re-checked in a per-block hot path.
+-_ENABLED = os.environ.get("VLLM_KV_TRANSFER_LOG", "1") != "0"
++# should be re-checked in a per-block hot path. Off by default -- see
++# module docstring.
++_ENABLED = os.environ.get("VLLM_KV_TRANSFER_LOG", "0") != "0"
+ 
+ # Request ids are long ("chatcmpl-<32 hex>-<8 hex>" once the connector appends
+ # its own suffix). Keep the head, which is what appears in the request log
+--- a/distributed/kv_transfer/kv_connector/v1/metrics.py
++++ b/distributed/kv_transfer/kv_connector/v1/metrics.py
+@@ -19,10 +19,14 @@
+ # line (KVConnectorLogging.log(), below) -- independent of
+ # VLLM_LOG_STATS_INTERVAL, which only controls how *often* it fires, not
+ # whether it fires at all. Matches VLLM_KV_TRANSFER_LOG / v1/kv_offload/
+-# transfer_log.py's convention: read once at import, on by default. The
+-# Prometheus metrics themselves (KVConnectorProm, elsewhere in this file)
+-# are untouched by this switch -- it only silences the log line.
+-_METRICS_LOG_ENABLED = os.environ.get("VLLM_KV_TRANSFER_METRICS_LOG", "1") != "0"
++# transfer_log.py's convention: read once at import. Off by default --
++# even readable and rate-limited (see the readability fix below), it's
++# raw connector-internal counters, one tier more detail than most people
++# watching a live server want; set VLLM_KV_TRANSFER_METRICS_LOG=1 to turn
++# it on. The Prometheus metrics themselves (KVConnectorProm, elsewhere in
++# this file) are untouched by this switch -- it only silences the log
++# line.
++_METRICS_LOG_ENABLED = os.environ.get("VLLM_KV_TRANSFER_METRICS_LOG", "0") != "0"
+ 
+ 
+ @dataclass
