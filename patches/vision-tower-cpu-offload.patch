@@ -1,0 +1,486 @@
+Keep a Qwen3-VL vision tower's transformer blocks out of VRAM, so the KV pool
+gets the bytes. Stock vLLM 0.27.1 cannot do this at all.
+
+Two backends, selected by VLLM_VISION_OFFLOAD_BACKEND (or VISION_OFFLOAD= in
+single-user/start_qwen.sh):
+
+  prefetch  RECOMMENDED. Weights live in pinned host RAM; each block is
+            streamed H2D into a small GPU staging pool just before it runs,
+            overlapped with the previous block's compute. Measured: +0.72 GiB
+            of KV pool, and free (within noise) on images >= 896px.
+  uva       Weights live in pinned host RAM and the GPU reads them across PCIe
+            *inside every GEMM* (zero-copy, no staging). Measured: +0.78 GiB --
+            marginally more, since there is no staging buffer -- but 2.8-4.8x
+            on image latency.
+  off       Upstream behavior (default). NB: at MAX_LEN=140000 this deployment
+            will not even START with the tower resident (see below).
+
+Why stock vLLM can't do either: --cpu-offload-gb / --cpu-offload-params are
+accepted without error but are a silent NO-OP for vision towers. The
+offloader's only call site in the entire codebase is
+`get_offloader().wrap_modules(...)` inside make_layers()
+(model_executor/models/utils.py), and make_layers() builds the *language model*
+decoder stack only (qwen3_5.py's Qwen3_5Model). The vision tower builds its
+blocks with a plain `nn.ModuleList` (qwen3_vl.py's Qwen3_VisionTransformer), so
+the offloader never sees them. Symptom: no "Total CPU offloaded parameters"
+line is logged and the KV pool shrinks by the full weight of the tower.
+Confirmed by grep: `wrap_modules` appears at exactly one call site.
+
+Note the *filter* would have worked -- "visual" is segment-exact (the matcher
+is `f".{param}." in f".{name}."`) and matches exactly the 333 model.visual.*
+tensors and zero language-model tensors on this checkpoint. It is only the
+call-site coverage that is missing.
+
+Both backends use a *dedicated* offloader instance rather than the global one,
+so this budget can neither be consumed by nor steal budget from language-model
+layers: for uva, cpu_offload_params is left empty (= "offload everything handed
+to me") and the only modules handed over are the ViT blocks.
+
+Only the 27 transformer blocks are offloaded (0.7664 of the tower's 0.8582
+GiB). patch_embed, pos_embed, merger and deepstack_merger_list stay in VRAM
+(0.0917 GiB): they are small and, unlike the blocks, are not a repeating unit
+whose staging buffers a slot pool could share. (On this checkpoint
+deepstack_visual_indexes is [], so deepstack_merger_list is empty.)
+
+Safe here because the ViT is neither torch.compile'd nor cudagraph'd in this
+deployment (compile_mm_encoder and cudagraph_mm_encoder are both False). Do not
+assume that holds if those are enabled -- see the _VisionPrefetchOffloader
+docstring, which depends on it directly.
+
+--------------------------------------------------------------------------
+THE PREFETCH BACKEND
+
+Mechanically it reuses vLLM 0.27.1's own PrefetchOffloader
+(model_executor/offloader/prefetch.py): _CpuParamOffloader copies each param to
+pinned host memory at *construction* time and frees the VRAM immediately --
+before load_weights, which then writes into the CPU tensors, the same ordering
+make_layers() already relies on. A StaticBufferPool allocates `prefetch_step`
+slots of each unique (name, shape, stride, dtype); block N uses slot
+N % prefetch_step. A dedicated copy stream does the H2D with per-layer events,
+so block N's compute waits only on block N's copy, and start_onload_to_static()
+forks off an event recorded on the compute stream so a copy can never overwrite
+a buffer whose reads are still enqueued.
+
+THREE HAZARDS, all of which this patch has to work around. Every one of them
+fails SILENTLY -- wrong pixels, not an exception -- so validate with
+test_vision_prefetch_offload.py, never by eyeballing generated text.
+
+1. THE STOCK HOOKS ROUTE THROUGH THE GLOBAL SINGLETON. PrefetchOffloader's
+   _hook_module_forward does not call itself -- it calls
+   torch.ops.vllm.wait_prefetch / start_prefetch, and those resolve the
+   offloader via the *global* get_offloader() (offloader/prefetch_ops.py:33,61).
+   A dedicated instance is invisible to them: they hit the global
+   NoopOffloader, whose _wait_for_layer / _start_prefetch are `pass`. That is
+   NO SYNCHRONIZATION AT ALL, so the compute stream reads staging buffers the
+   copy stream is still filling. _VisionPrefetchOffloader therefore overrides
+   _hook_module_forward to call through the instance. Measured as the negative
+   control in the test: 0/10 runs bit-exact, max abs err 490.6.
+   Bypassing the custom ops is only safe because the ViT is not
+   compiled/cudagraphed; their sole purpose is to give torch.compile a data
+   dependency it cannot reorder.
+
+2. THE STOCK WRAP-AROUND PREFETCH ALIASES A SLOT THAT IS STILL IN USE. Stock
+   _hook_module_forward ends each block with
+   `_start_prefetch((index + prefetch_step) % len(modules))`, pre-loading the
+   head of the stack for the next pass. That is only correct when
+   len(modules) % prefetch_step == 0. Otherwise the wrapped prefetch targets a
+   slot a LATER block of the SAME pass still needs. With this tower's 27 blocks
+   and prefetch_step=2: block 25 prefetches block 0 into slot 0, but block 26
+   also uses slot 0 and its weights were staged back at block 24 -- so block 26
+   computes on block 0's weights.
+   Measured, 27 blocks / dim 1152 / 2048 tokens:
+       27 blocks, step 2  ->  0/6 bit-exact (max abs err 2.172)   <-- the bug
+       27 blocks, step 3  ->  6/6 bit-exact  (3 divides 27)
+       26 blocks, step 2  ->  6/6 bit-exact  (2 divides 26)
+   End to end it was visible as a single misread character in an OCR
+   transcription -- exactly the kind of thing that reads as "the model is a bit
+   weak at OCR" rather than as a bug.
+   Fix: never wrap. The hook prefetches only while index + step < len, and
+   prime() re-stages the head of the stack at the top of every forward. That is
+   correct for any block count and any prefetch_step. Verified 6/6 bit-exact at
+   27/step2, 27/step3, 27/step4 and 26/step2, and 10/10 at 27/step2 with 4096
+   tokens.
+
+3. post_init() NEVER RUNS FOR A DEDICATED INSTANCE. It allocates the staging
+   pool, calls sync_cpu_storage() (picking up anything
+   process_weights_after_loading changed) and repoints params at GPU buffers.
+   The stock call site (gpu_model_runner.py:5572, after load_model) drives only
+   the global offloader. Without it the params are still CPU tensors and the
+   first ViT forward dies on a device mismatch. This patch calls it lazily from
+   Qwen3_VisionTransformer.forward, which is after weight loading by
+   construction and lands on the profiling run's dummy image encode -- so the
+   staging pool is counted in the profiled peak and correctly excluded from the
+   KV pool instead of overcommitting it. Confirmed in the startup log: the
+   "Initialized 27 modules" line appears ~3 minutes before "Available KV cache
+   memory".
+
+--------------------------------------------------------------------------
+MEASURED (2026-08-25, this box: RTX 3090 @250 W, PCIe 4.0 x16, i7-6700K,
+Qwen3.5-27B W4A16, CTX=long / fp8 KV, --max-num-seqs 8, MTP spec decode,
+--limit-mm-per-prompt image 1024x1024 + --mm-processor-kwargs max_pixels
+1048576, so the "1280" row below is really a 1024px image.)
+
+Tower size, from the checkpoint's safetensors headers (333 model.visual.*
+tensors, all BF16 -- the ViT is in the quantizer's 206-entry `ignore` list, so
+it is unquantized even though the LM is W4A16):
+
+  blocks (27)                324 tensors   0.7664 GiB   29.07 MiB/block
+  merger                       6 tensors   0.0835 GiB
+  patch_embed + pos_embed      3 tensors   0.0082 GiB
+  TOTAL                      333 tensors   0.8582 GiB
+
+The offloader reports exactly that: "Total GPU memory saved: 0.8227 GB, Static
+buffer pool: 0.0609 GB" (= 0.7662 GiB offloaded, 0.0567 GiB staged).
+
+KV pool:
+
+  backend    pool       tokens    @140k   note
+  off        5.18 GiB   --        --      REFUSES TO START at MAX_LEN=140000:
+                                          "5.34 GiB KV cache is needed, which
+                                          is larger than the available KV cache
+                                          memory (5.2 GiB) ... estimated
+                                          maximum model length is 136000"
+  off        5.18 GiB   132,680   1.02x   at MAX_LEN=130000
+  prefetch   5.90 GiB   153,592   1.10x
+  uva        5.96 GiB   154,951   1.11x
+
+So on this config the choice is not "vision costs some KV pool" -- with the
+tower resident the server does not come up at all at the configured context
+length. Run-to-run variation on the profiled pool is ~±0.03 GiB (a second
+prefetch run measured 5.93 GiB / 154,951; a second uva run 5.99 / 156,310), so
+treat the prefetch-vs-uva gap as ~0.06 GiB / ~1,400 tokens -- which is just the
+staging pool, as expected.
+
+Image latency, median of 5 unique images per size (bench/vision_offload_ab.py;
+every image is unique so neither the mm-processor cache nor the prefix cache
+can serve a repeat). End-to-end request time including 8 output tokens, so the
+fixed ~0.15 s of prefill+decode is in every number:
+
+  size    vis_tok   off      prefetch          uva
+   224px       85   0.185s   0.232s (+0.047)   0.527s (2.8x)
+   448px      217   0.286s   0.330s (+0.044)   1.380s (4.8x)
+   896px      805   0.831s   0.835s (+0.004)   2.553s (3.1x)
+  1024px     1045   1.075s   1.068s (-0.007)   3.824s (3.6x)
+
+prefetch costs a fixed ~45 ms on small images and nothing measurable at 896px
+and above -- i.e. exactly the ~41 ms it takes to pull 0.7664 GiB across a
+~20 GB/s link once. On a small image the ViT has too little compute to hide it;
+by 896px each block's compute (~30 ms) dwarfs its 1.5 ms of transfer. For the
+OCR case -- full-page images -- streaming is free.
+
+uva's cost instead SCALES with image size, and is far worse, because GEMM
+kernels tile: a weight tile is re-read once per row-block of the activation
+matrix, so a forward pass reads each weight many times. A 1024px image is
+~4,096 patches, so the (1152 x 3456) qkv weight is re-read on the order of 30x
+per layer. In VRAM (~936 GB/s) those re-reads are nearly free; across PCIe they
+dominate. L2 (6 MB on a 3090) absorbs some but not most of it. The prefetch
+backend sidesteps this entirely by reading each weight exactly ONCE per image,
+into VRAM, where the re-reads run at full bandwidth.
+
+The general lesson: UVA weight offloading suits memory-bound, low-arithmetic-
+intensity layers, not a compute-heavy ViT fed large activation matrices.
+Streaming suits anything whose weights are read a bounded number of times.
+
+Choosing a backend:
+  - prefetch (recommended): ~1,400 KV tokens worse than uva, ~60x cheaper on
+    latency at 1024px. VLLM_VISION_PREFETCH_STEP=3 buys a block more slack
+    against PCIe contention for 29.1 MiB more staging.
+  - uva: only if you want the last ~0.06 GiB and images are rare enough that
+    +0.3-2.7 s each does not matter. Set VLLM_VISION_CPU_OFFLOAD_GB > 0.
+  - off: only below ~136k context on this box.
+Capping --limit-mm-per-prompt's width/height also directly bounds the worst
+case, since both backends' overhead scales with patch count.
+
+Host RAM: the pinned 0.7664 GiB is not free on a 32 GB box that also gives
+20 GiB to the offload connector's CPU KV tier. Consider dropping
+cpu_bytes_to_use by ~1 GiB when enabling this.
+
+NOT YET MEASURED: image latency under concurrent long-context load. The offload
+connector moves KV blocks over the same PCIe link, and contention is the main
+remaining risk to the prefetch backend's overlap. prefetch_step=3 is the
+mitigation if it bites.
+
+--- a/envs.py
++++ b/envs.py
+@@ -190,6 +190,11 @@
+     # request-logging patch: mamba-align stale-checkpoint offload slack (see
+     # patches/mamba-align-stale-checkpoint-offload-slack.patch)
+     VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS: int = 0
++    # request-logging patch: vision-tower weight offloading (see
++    # patches/vision-tower-cpu-offload.patch)
++    VLLM_VISION_OFFLOAD_BACKEND: Literal["auto", "off", "uva", "prefetch"] = "auto"
++    VLLM_VISION_CPU_OFFLOAD_GB: float = 0
++    VLLM_VISION_PREFETCH_STEP: int = 2
+     VLLM_DRAFT_TOPK_TOPP: bool = True
+     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+@@ -1496,6 +1501,36 @@
+     "VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS": lambda: int(
+         os.environ.get("VLLM_MAMBA_ALIGN_STALE_SLACK_BLOCKS", "0")
+     ),
++    # request-logging patch: how to keep the Qwen3-VL vision tower's 27
++    # transformer blocks (0.7664 GiB, bf16 -- the ViT is in the checkpoint
++    # quantizer's `ignore` list) out of VRAM, so the KV pool gets the bytes.
++    # Stock --cpu-offload-gb / --cpu-offload-params cannot reach a vision
++    # tower at all: the offloader's only call site is get_offloader().
++    # wrap_modules() inside make_layers(), which builds the *language model*
++    # decoder stack. See patches/vision-tower-cpu-offload.patch.
++    #
++    #   off      -- weights in VRAM (upstream behavior)
++    #   prefetch -- stream each block into a small GPU staging pool just
++    #               before it runs, overlapped with the previous block's
++    #               compute. ~0.71 GiB recovered, ~1-3% encode cost.
++    #   uva      -- weights stay in pinned host RAM; the GPU reads them over
++    #               PCIe *inside every GEMM*. ~0.77 GiB recovered, but
++    #               2.6-3.8x encode cost because GEMMs re-read weight tiles.
++    #   auto     -- "uva" if VLLM_VISION_CPU_OFFLOAD_GB > 0 else "off"
++    #               (back-compat with the original UVA-only knob).
++    "VLLM_VISION_OFFLOAD_BACKEND": lambda: os.environ.get(
++        "VLLM_VISION_OFFLOAD_BACKEND", "auto"
++    ),
++    # uva backend only: budget in GiB. 0 = off.
++    "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
++        os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
++    ),
++    # prefetch backend only: how many blocks ahead to stream, which is also
++    # the number of staging slots. 2 = double buffering (58.1 MiB here);
++    # 3 buys a block more slack against PCIe contention for 29.1 MiB more.
++    "VLLM_VISION_PREFETCH_STEP": lambda: int(
++        os.environ.get("VLLM_VISION_PREFETCH_STEP", "2")
++    ),
+     "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
+     # The activation dtype config for humming kernel
+     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
+--- a/model_executor/models/qwen3_vl.py
++++ b/model_executor/models/qwen3_vl.py
+@@ -56,9 +56,11 @@
+     VideoDummyOptions,
+     VideoPruningMethod,
+ )
++import vllm.envs as envs
+ from vllm.distributed import get_pp_group, parallel_state
+ from vllm.inputs import MultiModalDataDict
+ from vllm.logger import init_logger
++from vllm.model_executor.offloader.prefetch import PrefetchOffloader
+ from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
+ from vllm.model_executor.layers.attention.mm_encoder_attention import (
+     MMEncoderAttention,
+@@ -527,6 +529,83 @@
+         return out
+ 
+ 
++# request-logging patch: vision-tower weight offloading.
++# See patches/vision-tower-cpu-offload.patch.
++class _VisionPrefetchOffloader(PrefetchOffloader):
++    """PrefetchOffloader that drives its own hooks instead of the global one.
++
++    Stock ``PrefetchOffloader._hook_module_forward`` does not call itself: it
++    goes through ``torch.ops.vllm.wait_prefetch`` / ``start_prefetch``, and
++    those resolve the offloader via the *global* singleton ``get_offloader()``
++    (offloader/prefetch_ops.py). The vision tower needs a **dedicated**
++    instance, so its budget can neither be consumed by nor steal budget from
++    language-model layers -- and a dedicated instance is invisible to those
++    ops. They would hit the global ``NoopOffloader``, whose ``_wait_for_layer``
++    and ``_start_prefetch`` are ``pass``.
++
++    That failure is silent and it is not a slowdown: it is *no synchronization
++    at all*, so the compute stream reads staging buffers while the copy stream
++    is still filling them. The tower then emits plausible-looking but wrong
++    embeddings, non-deterministically. Hence: call through the instance.
++
++    Bypassing the custom ops is only safe because the ViT is neither
++    torch.compile'd nor cudagraph'd here (``compile_mm_encoder`` and
++    ``cudagraph_mm_encoder`` both default to False, and neither is enabled in
++    this deployment). Their sole purpose is to give torch.compile a data
++    dependency it cannot reorder. If those flags are ever turned on, this
++    class -- and the whole design -- must be revisited.
++    """
++
++    def prime(self) -> None:
++        """Load the first `prefetch_step` blocks before a forward pass starts.
++
++        Replaces the stock hook's wrap-around prefetch -- see the slot-aliasing
++        note in _hook_module_forward. Safe to call at the top of every forward:
++        start_onload_to_static() forks off an event recorded on the compute
++        stream, so these copies queue behind all of the previous image's work.
++        """
++        for i in range(min(self.prefetch_step, len(self.module_offloaders))):
++            self._start_prefetch(i)
++
++    def _hook_module_forward(self, index: int, module: nn.Module):
++        original_forward = module.forward
++
++        def forward(*args, **kwargs):
++            # Swap the real forward back in so the call below does not recurse.
++            module.forward = original_forward
++            try:
++                self._wait_for_layer(index)
++                output = original_forward(*args, **kwargs)
++                # Kick off the block that will land in the slot this one just
++                # freed. start_onload_to_static() forks off an event recorded
++                # on the compute stream, so the copy cannot overwrite a buffer
++                # whose reads are still enqueued.
++                #
++                # NB: stock PrefetchOffloader wraps here --
++                # `(index + prefetch_step) % len(...)` -- to pre-load the head
++                # of the stack for the next pass. That is only safe when
++                # len(modules) % prefetch_step == 0. Otherwise the wrapped
++                # prefetch targets a slot that a LATER block of this same pass
++                # still needs, and clobbers it. With this tower's 27 blocks and
++                # prefetch_step=2: block 25 prefetches block 0 into slot 0,
++                # but block 26 also uses slot 0 and its weights were staged
++                # back at block 24 -- so block 26 computes on block 0's
++                # weights. Measured: 0/10 passes bit-exact at 27/step=2, 6/6 at
++                # 27/step=3 and at 26/step=2.
++                #
++                # So: never wrap. prime() re-loads the head of the stack at the
++                # start of each forward instead, which is correct for any block
++                # count and any prefetch_step.
++                next_index = index + self.prefetch_step
++                if next_index < len(self.module_offloaders):
++                    self._start_prefetch(next_index)
++                return output
++            finally:
++                module.forward = forward
++
++        module.forward = forward
++
++
+ class Qwen3_VisionTransformer(nn.Module):
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_stacked={
+@@ -625,20 +704,93 @@
+             dtype=torch.get_default_dtype(),
+         )
+ 
+-        self.blocks = nn.ModuleList(
+-            [
+-                Qwen3_VisionBlock(
+-                    dim=self.hidden_size,
+-                    num_heads=self.num_heads,
+-                    mlp_hidden_dim=vision_config.intermediate_size,
+-                    act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
+-                    norm_layer=norm_layer,
+-                    quant_config=quant_config,
+-                    prefix=f"{prefix}.blocks.{layer_idx}",
+-                )
+-                for layer_idx in range(vision_config.depth)
+-            ]
+-        )
++        def _make_block(layer_idx: int) -> "Qwen3_VisionBlock":
++            return Qwen3_VisionBlock(
++                dim=self.hidden_size,
++                num_heads=self.num_heads,
++                mlp_hidden_dim=vision_config.intermediate_size,
++                act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
++                norm_layer=norm_layer,
++                quant_config=quant_config,
++                prefix=f"{prefix}.blocks.{layer_idx}",
++            )
++
++        # request-logging patch: optionally keep the ViT blocks' weights out of
++        # VRAM so the KV pool gets the bytes (see
++        # patches/vision-tower-cpu-offload.patch).
++        #
++        # Stock --cpu-offload-gb / --cpu-offload-params cannot reach a vision
++        # tower: the offloader's only call site in vLLM is
++        # get_offloader().wrap_modules() inside make_layers()
++        # (model_executor/models/utils.py), which builds the *language model*
++        # decoder stack. The tower's blocks are a plain nn.ModuleList, so the
++        # offloader never sees them and the flags are a silent no-op.
++        #
++        # Both backends use a *dedicated* offloader instance rather than the
++        # global one, so this budget cannot be consumed by (or steal budget
++        # from) language-model layers.
++        #
++        # Only the transformer blocks are offloaded. patch_embed, pos_embed,
++        # merger and deepstack_merger_list stay in VRAM (0.0917 GiB): they are
++        # small, and unlike the blocks they are not a repeating unit whose
++        # staging buffers a slot pool could share.
++        self._vision_offloader = None
++        self._vision_offloader_ready = False
++
++        backend = envs.VLLM_VISION_OFFLOAD_BACKEND
++        if backend == "auto":
++            # Back-compat with the original UVA-only knob.
++            backend = "uva" if envs.VLLM_VISION_CPU_OFFLOAD_GB > 0 else "off"
++
++        if backend == "prefetch":
++            prefetch_step = max(2, envs.VLLM_VISION_PREFETCH_STEP)
++            offloader = _VisionPrefetchOffloader(
++                # group_size=1 / num_in_group=1 => offload every block.
++                group_size=1,
++                num_in_group=1,
++                prefetch_step=prefetch_step,
++                mode="cpu",
++            )
++            blocks = offloader.wrap_modules(
++                _make_block(layer_idx) for layer_idx in range(vision_config.depth)
++            )
++            # post_init() has to run after load_weights (see forward()).
++            self._vision_offloader = offloader
++            logger.info(
++                "Vision tower: streaming ViT blocks from pinned host RAM "
++                "(prefetch_step=%d, %d blocks). Each block's weights are "
++                "copied H2D into a small GPU staging pool just before it runs, "
++                "overlapped with the previous block's compute.",
++                prefetch_step,
++                len(blocks),
++            )
++        elif backend == "uva":
++            from vllm.model_executor.offloader.uva import UVAOffloader
++
++            # cpu_offload_params is left empty, which means "offload everything
++            # handed to me", and the only modules handed over are ViT blocks.
++            vision_offload_gib = envs.VLLM_VISION_CPU_OFFLOAD_GB
++            offloader = UVAOffloader(int(vision_offload_gib * (1024**3)))
++            blocks = offloader.wrap_modules(
++                _make_block(layer_idx) for layer_idx in range(vision_config.depth)
++            )
++            logger.info(
++                "Vision tower: CPU-offloading ViT blocks via UVA "
++                "(budget %.2f GiB, %d blocks). Weights live in pinned host RAM "
++                "and are read over PCIe during the forward pass; compute stays "
++                "on the GPU.",
++                vision_offload_gib,
++                len(blocks),
++            )
++        elif backend == "off":
++            blocks = [_make_block(layer_idx) for layer_idx in range(vision_config.depth)]
++        else:
++            raise ValueError(
++                f"VLLM_VISION_OFFLOAD_BACKEND={backend!r} is not one of "
++                "'auto', 'off', 'uva', 'prefetch'"
++            )
++
++        self.blocks = nn.ModuleList(blocks)
+ 
+     @property
+     def dtype(self) -> torch.dtype:
+@@ -815,6 +967,26 @@
+         *,
+         encoder_metadata: dict[str, torch.Tensor] | None = None,
+     ) -> torch.Tensor:
++        # request-logging patch: the prefetch offloader's post_init() allocates
++        # the GPU staging pool and repoints the block params at it, and must run
++        # *after* load_weights and process_weights_after_loading. The stock call
++        # site (gpu_model_runner.py, right after load_model) drives only the
++        # global offloader, so a dedicated instance has to do it itself.
++        #
++        # First forward is the right moment on both counts: it is after weight
++        # loading by construction, and it is the memory-profiling run's dummy
++        # image encode -- so the staging pool is counted in the profiled peak
++        # and correctly excluded from the KV pool rather than overcommitting it.
++        # (If the log line below never appears at startup, the profile run did
++        # not encode a dummy image and the pool is being allocated late, on the
++        # first real request. See patches/vision-tower-cpu-offload.patch.)
++        if self._vision_offloader is not None:
++            if not self._vision_offloader_ready:
++                self._vision_offloader_ready = True
++                self._vision_offloader.post_init()
++            # Stage the first blocks for THIS pass (the hooks never wrap).
++            self._vision_offloader.prime()
++
+         hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+         hidden_states = self.patch_embed(hidden_states)
+ 

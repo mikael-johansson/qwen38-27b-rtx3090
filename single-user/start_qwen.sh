@@ -226,6 +226,62 @@ if [ -n "$REQUEST_LOG_DIR" ]; then
   export REQUEST_LOG_DIR
 fi
 
+# VISION=1 loads the model's vision tower. Default stays text-only:
+# --language-model-only sets limit_mm_per_prompt=0 for every modality, which
+# makes vLLM's _mark_tower_model skip *instantiating* the tower, so it costs no
+# VRAM at all.
+#
+# VISION_OFFLOAD selects where the ViT's 27 transformer blocks (0.7664 GiB of
+# the tower's 0.8582, BF16 — the ViT is excluded from the W4A16 quant) live,
+# since that is KV pool you are giving up. Stock --cpu-offload-gb cannot reach a
+# vision tower at all; see patches/vision-tower-cpu-offload.patch for why and
+# for the measured numbers.
+#
+#   prefetch  (default) streamed H2D into a small staging pool per block,
+#             overlapped with the previous block's compute. +0.72 GiB of KV
+#             pool back; free (within noise) on images >= 896px, ~+45 ms on
+#             thumbnails.
+#   uva       zero-copy reads over PCIe inside every GEMM. +0.78 GiB — a little
+#             more, since there is no staging buffer — but 2.8-4.8x on image
+#             latency.
+#   off       weights in VRAM. NB: at MAX_LEN=140000 the engine then refuses to
+#             start at all (needs 5.34 GiB of KV pool, has 5.18).
+#
+# With VISION=1 the caller must also pass, via EXTRA_ARGS, at minimum a
+# --limit-mm-per-prompt: the 999-per-modality default makes startup memory
+# profiling reserve an absurd activation peak. See micke-start-vision.sh.
+LM_ONLY_ARG="--language-model-only"
+if [ "${VISION:-0}" = "1" ]; then
+  LM_ONLY_ARG=""
+  # Fail loudly if the patch is not installed. Without it vLLM does not know
+  # VLLM_VISION_OFFLOAD_BACKEND, silently ignores it, and loads the tower fully
+  # resident — which at MAX_LEN=140000 means the engine refuses to start, with
+  # an error about KV cache size that gives no hint the vision setting was
+  # dropped.
+  if [ "${VISION_OFFLOAD:-prefetch}" != "off" ]; then
+    _sp=$(venv/bin/python -c 'import vllm,os;print(os.path.dirname(vllm.__file__))' 2>/dev/null)
+    if ! grep -q VLLM_VISION_OFFLOAD_BACKEND "$_sp/envs.py" 2>/dev/null; then
+      echo "VISION_OFFLOAD=${VISION_OFFLOAD:-prefetch} needs patches/vision-tower-cpu-offload.patch," >&2
+      echo "which is not applied to $_sp. Apply it with:" >&2
+      echo "  patch -p1 -d \"$_sp\" < patches/vision-tower-cpu-offload.patch" >&2
+      exit 1
+    fi
+  fi
+  case "${VISION_OFFLOAD:-prefetch}" in
+    prefetch)
+      export VLLM_VISION_OFFLOAD_BACKEND=prefetch
+      export VLLM_VISION_PREFETCH_STEP=${VISION_PREFETCH_STEP:-2} ;;
+    uva)
+      export VLLM_VISION_OFFLOAD_BACKEND=uva
+      export VLLM_VISION_CPU_OFFLOAD_GB=${VISION_OFFLOAD_GB:-1} ;;
+    off)
+      export VLLM_VISION_OFFLOAD_BACKEND=off ;;
+    *)
+      echo "VISION_OFFLOAD must be prefetch, uva or off (got '$VISION_OFFLOAD')" >&2
+      exit 1 ;;
+  esac
+fi
+
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
   --host 0.0.0.0 --port $PORT \
@@ -233,7 +289,7 @@ exec venv/bin/vllm serve "$MODEL" \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count $API_SERVERS \
-  --language-model-only \
+  ${LM_ONLY_ARG} \
   $ATTN_ARGS \
   --mamba-ssm-cache-dtype float16 \
   ${ASYNC_ARGS} \
