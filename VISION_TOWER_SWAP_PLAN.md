@@ -405,6 +405,33 @@ production ones:
 > all `!` from the *first* token, and spec-decode acceptance sits at exactly
 > 1.00 / 0.0%. (A *semantic* loop with healthy acceptance is a different bug.)
 
+### Re-measured on `vision2` (2026-08-26)
+
+All figures in §0 were taken on the old `vision` branch. Re-measured on
+`vision2`, the KV pool is **better**, because `vision2` keeps the fp16 SSM state
+(half the recurrent cache of the old branch's float32), so the same GiB holds
+more tokens — 28,065 tok/GiB vs 26,130:
+
+| | pool | tokens | @140k |
+|---|---|---|---|
+| text-only production (measured earlier, same commit) | 6.11 GiB | 171,956 | 1.23x |
+| **vision2 + prefetch** | **5.91 GiB** | **165,869** | **1.18x** |
+
+**Enabling vision now costs 6,087 tokens — 3.5%.** That is very close to the
+~6,200 originally derived in §0, and far better than the ~26,600 the old branch
+implied. Latency is unchanged (median s, 5 unique images):
+
+| size | vis_tok | vision2 prefetch | old branch prefetch |
+|---|---|---|---|
+| 224px | 85 | 0.233 | 0.232 |
+| 448px | 217 | 0.330 | 0.330 |
+| 896px | 805 | 0.835 | 0.835 |
+| 1024px | 1045 | 1.079 | 1.068 |
+
+Correctness re-verified on `vision2`: 10/10 bit-exact at real ViT scale
+(27 blocks / dim 1152 / 4096 tokens), negative control 0/10 as expected, and the
+OCR transcript matches the resident-weight baseline exactly.
+
 ## 6. Status
 
 **Implemented, measured, and validated** (2026-08-25). See §0 for results.
