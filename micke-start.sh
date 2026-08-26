@@ -124,3 +124,10 @@ bash single-user/start_qwen.sh
 # request this size self-preempts repeatedly even with zero contention, so
 # admission-control against a second request was never the fix for the
 # bulk of the observed latency. See 2026-08-21 conversation.
+#
+# NOTE (2026-08-26): do NOT run this with VISION=1. This script has no
+# --limit-mm-per-prompt / --mm-processor-kwargs caps, so the multimodal encoder
+# profiles at maximum feature size: the encoder cache budget comes out 16384
+# tokens instead of 2048, eating ~1.55 GiB and leaving only 4.38 GiB of KV --
+# below the 4.96 GiB one 140000-token request needs, so the engine refuses to
+# start. Use micke-start-vision.sh for the vision config; it carries the caps.
