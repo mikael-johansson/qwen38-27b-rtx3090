@@ -432,6 +432,63 @@ Correctness re-verified on `vision2`: 10/10 bit-exact at real ViT scale
 (27 blocks / dim 1152 / 4096 tokens), negative control 0/10 as expected, and the
 OCR transcript matches the resident-weight baseline exactly.
 
+### NVMe disk cache: broken, fixed, and verified across restarts (2026-08-26)
+
+Symptom: prefix caching looked dead — 88k-token prompts reprefilling at 0.0%
+cached, and a flood of `EVICT ... about to be physically reused` debug lines.
+
+**Root cause was a full disk, and a disk cap that could not see it.** The fs
+tier's LRU cap scanned only `<base_path>_r<rank>` — its own block directory.
+`FileMapper.base_path` embeds a hash of the KV cache group layout, so enabling
+the vision tower minted a new directory and stranded the old one, which no
+running server's cap thread ever pointed at. Effective usage became
+N_configs x max_disk_gib:
+
+| directory | size | status |
+|---|---|---|
+| `…rtx3090…_62c2bcb49bc6_r0` | 201 G | production's, stranded by the path change |
+| `…vision-swap…_404351fb3638_r0` | 20 G | float32, left over from testing |
+| `…vision-swap…_2e1d7ff99b5f_r0` | 2.4 G | the live one, far under its 200 GiB cap |
+
+234 GB filesystem at **100% full, 24 MB free**, 502 x `[Errno 28] No space left
+on device`, zero external hits served — while serving continued silently.
+
+`bf0c4f5` on `no-vision` had already fixed this (`_disk_cap_dir = root_dir`) and
+its own commit message documents the identical 2026-08-23 incident; the fix had
+simply never reached `restore-corruption`/`vision2`. Ported here. The 200 -> 175
+GiB reduction that came with it was *not* ported: that margin only existed
+because each config was capped separately, and with a single global budget over
+`root_dir` it buys nothing — 200 GiB on a 234 GiB filesystem leaves 34 GiB of
+headroom against a thread that re-scans every 2 minutes.
+
+Now working as intended:
+
+```
+KV offload fs tier: disk cap exceeded (210.05 GiB > 200.00 GiB) -- evicted 373
+least-recently-accessed block(s), freed 10.06 GiB, now approximately 199 GiB
+```
+
+LRU across the whole root, so the stranded production directory is trimmed first
+(201 G -> 165 G) while the live one grows (2.4 G -> 38 G). Zero ENOSPC since.
+
+**Restart survival verified** (`test_kv_disk_cache_survival.py`) — the hunch that
+it never survived restarts was true only while the disk was full:
+
+| 137,345-token prompt | cached | uncached | wall |
+|---|---|---|---|
+| same prompt, **fresh process** | **100.0%** | 65 | **16.5 s** |
+| never-seen prompt (control) | 0.0% | 137,258 | 187.2 s |
+
+**11.3x.** After a restart the GPU and CPU tiers are empty, so everything reused
+came from disk. This depends on `PYTHONHASHSEED=0` (reproducible block hashes)
+*and* a stable cache-directory hash.
+
+> **Note for production:** the cache directory name contains the model *path*,
+> and this worktree reaches the model through its own symlink
+> (`qwen38-27b-vision-swap/models/...`) rather than `qwen38-27b-rtx3090/models/...`.
+> So the vision server and production keep **separate** caches and each warms
+> from cold. Point both at one path if you want them to share.
+
 ## 6. Status
 
 **Implemented, measured, and validated** (2026-08-25). See §0 for results.
