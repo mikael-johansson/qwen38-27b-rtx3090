@@ -1,0 +1,135 @@
+Stop a structured-output request with invalid speculative drafts from taking the
+engine down with `CUDA error: an illegal memory access was encountered`.
+
+WHAT HAPPENS
+
+`v1/structured_output/utils.py` reorders the grammar bitmask to match batch
+order, then hands `out_indices` straight to a CUDA kernel:
+
+    xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=index_tensor)
+
+xgrammar's kernel indexes `logits` with those values and does not bounds-check
+them. The indices are built as:
+
+    num_spec_tokens = len(spec_tokens.get(req_id, ()))
+    for i in range(1 + num_spec_tokens):
+        out_indices.append(logit_idx + i)
+
+`num_spec_tokens` counts the speculative *slots the scheduler reserved*, not the
+drafts that turned out valid. vLLM's invalid-draft sentinel is -1 (see
+`is_valid_mask = (token_ids != -1) & ...` in v1/spec_decode/utils.py:219). When
+a request's drafts come back invalid, `logit_idx + num_spec_tokens` can point
+past the end of `logits`, and the kernel reads out of bounds.
+
+The fault is asynchronous, so it surfaces at whatever unrelated CUDA sync point
+comes next -- in the observed case `synchronize_input_prep` inside a dynamo
+compile of `_prepare_inputs`, which makes the traceback actively misleading.
+
+OBSERVED (2026-08-26 07:23:19, this box)
+
+Hermes' chat-title generator -- a small text-only request that ends "Reply with
+JSON only", i.e. guided decoding -- scheduled with three invalid drafts while
+sharing a batch with an 832-token prefill chunk:
+
+    num_scheduled_tokens={a57b4806...: 4, a71be0b5...: 832}
+    scheduled_spec_decode_tokens={a57b4806...: [-1, -1, -1]}
+    has_structured_output_requests=true
+    pending_structured_output_tokens=true
+
+`apply_token_bitmask_inplace_kernel` JIT-compiled during inference in the same
+second (jit_monitor warning), consistent with a shape it had never seen.
+
+This is very likely the same fault as the "**Known rare crash, not yours to
+fix**: `torch.AcceleratorError: CUDA error: an illegal memory access` under
+3-way load (seen once, 2026-08-23)" recorded in HIT_DIVERGED_FIX_PLAN.md:163 --
+which predates all vision work, so this is NOT a vision-tower regression.
+ENCOURAGING_WORDS.md implicates `--async-scheduling` in that crash;
+`--async-scheduling` is on by default in 0.27.1 and active in this deployment
+(`ASYNC_ARGS`, single-user/start_qwen.sh:187). Whether async scheduling widens
+the window for a mismatch between reserved spec slots and actual logits rows is
+untested. Note the 2026-08-23 traceback was never saved and its log has since
+been rotated away, so "same fault" is inference from a matching signature, not
+a confirmed match.
+
+THE FIX
+
+Bounds-check each bitmask row index against `logits.shape[0]` (and the source
+row against `grammar_bitmask.shape[0]`) before writing it or appending it to
+`out_indices`. Dropping an out-of-range row leaves that one position
+un-grammar-masked for a single step, which the next step corrects; indexing it
+takes the whole engine down. That trade is not close.
+
+`cumulative_index` still advances by the full reserved amount, because that is
+the stride the structured-output manager used when laying out the bitmask's
+rows -- changing it would misalign every later request in the batch.
+
+A `logger.warning` fires whenever any row is skipped, reporting the row counts,
+the request ids and their spec tokens, so it is visible whether this ever
+actually triggers rather than silently papering over the condition. If it never
+fires, the diagnosis above is wrong and this patch is inert -- which is the
+point of logging it.
+
+Grep for: `structured-output bitmask: skipped`
+
+--- a/v1/structured_output/utils.py
++++ b/v1/structured_output/utils.py
+@@ -131,14 +131,59 @@
+     )
+     sorted_bitmask = sorted_bitmask_tensor.numpy()
+     cumulative_index = 0
++    # request-logging patch: bounds-guard the bitmask row indices (see
++    # patches/structured-output-bitmask-bounds.patch).
++    #
++    # out_indices is handed straight to a CUDA kernel below
++    # (xgr.apply_token_bitmask_inplace), which indexes `logits` with it and does
++    # NOT bounds-check. num_spec_tokens counts the speculative *slots* the
++    # scheduler reserved, not the draft tokens that turned out valid -- vLLM
++    # uses -1 as the invalid-draft sentinel (see `token_ids != -1` in
++    # v1/spec_decode/utils.py). When a request's drafts come back invalid, or
++    # the batch is otherwise smaller than the reserved slots imply,
++    # `logit_idx + i` can run past the end of `logits`, and the kernel then
++    # reads out of bounds: `CUDA error: an illegal memory access was
++    # encountered`, reported asynchronously at some later, unrelated sync point.
++    #
++    # Observed 2026-08-26 07:23:19 on a structured-output request scheduled with
++    # `scheduled_spec_decode_tokens={...: [-1, -1, -1]}` (three invalid drafts)
++    # sharing a batch with an 832-token prefill chunk. Same signature as the
++    # "known rare crash ... under 3-way load (seen once, 2026-08-23)" recorded in
++    # HIT_DIVERGED_FIX_PLAN.md, which predates any vision work.
++    #
++    # cumulative_index advances by the FULL reserved amount regardless, because
++    # that is the stride the structured-output manager used when it laid out
++    # grammar_bitmask's rows; changing it would misalign every later request.
++    max_rows = sorted_bitmask.shape[0]
++    src_rows = grammar_bitmask.shape[0]
++    skipped = 0
+     for req_id in grammar_output.structured_output_request_ids:
+         num_spec_tokens = len(spec_tokens.get(req_id, ()))
+         if (logit_idx := struct_out_req_batch_indices.get(req_id)) is not None:
+             for i in range(1 + num_spec_tokens):
+                 bitmask_index = logit_idx + i
++                if bitmask_index >= max_rows or cumulative_index + i >= src_rows:
++                    # Out of range: dropping the row only leaves that position
++                    # ungrammar-masked for this step, which the next step
++                    # corrects. Indexing it would take the engine down.
++                    skipped += 1
++                    continue
+                 sorted_bitmask[bitmask_index] = grammar_bitmask[cumulative_index + i]
+                 out_indices.append(bitmask_index)
+         cumulative_index += 1 + num_spec_tokens
++    if skipped:
++        logger.warning(
++            "structured-output bitmask: skipped %d out-of-range row(s) "
++            "(logits rows=%d, bitmask rows=%d, reqs=%s, spec_tokens=%s). "
++            "Without this guard these indices reach the CUDA kernel and crash "
++            "the engine with an illegal memory access. See "
++            "patches/structured-output-bitmask-bounds.patch.",
++            skipped,
++            max_rows,
++            src_rows,
++            list(grammar_output.structured_output_request_ids),
++            {r: list(spec_tokens.get(r, ())) for r in grammar_output.structured_output_request_ids},
++        )
+ 
+     # Copy async to device.
+     grammar_bitmask = sorted_bitmask_tensor.to(logits.device, non_blocking=True)
