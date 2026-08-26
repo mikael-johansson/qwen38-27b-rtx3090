@@ -73,7 +73,7 @@ Wired up in micke-start.sh's kv-transfer-config JSON: added
 
 --- a/v1/kv_offload/tiering/fs/manager.py
 +++ b/v1/kv_offload/tiering/fs/manager.py
-@@ -18,6 +18,7 @@
+@@ -18,6 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
  import functools
  import json
  import os
@@ -81,7 +81,7 @@ Wired up in micke-start.sh's kv-transfer-config JSON: added
  from collections.abc import Iterable
  from typing import TYPE_CHECKING, ClassVar
  
-@@ -116,6 +117,8 @@
+@@ -116,6 +117,8 @@ class FileSystemTierManager(SecondaryTierManager):
          n_write_threads: int = 16,
          enable_kv_events: bool = False,
          locality: str | None = None,
@@ -90,7 +90,7 @@ Wired up in micke-start.sh's kv-transfer-config JSON: added
      ):
          """
          Args:
-@@ -131,6 +134,24 @@
+@@ -131,6 +134,24 @@ class FileSystemTierManager(SecondaryTierManager):
                  cache events are enabled globally (kv_events_config).
              locality: Whether this tier's storage is LOCAL or REMOTE relative
                  to the publishing vLLM instance.
@@ -115,15 +115,33 @@ Wired up in micke-start.sh's kv-transfer-config JSON: added
          """
          super().__init__(offloading_spec, primary_kv_view, tier_type)
          self.locality = Locality(locality) if locality is not None else None
-@@ -192,6 +213,112 @@
+@@ -192,6 +213,130 @@ class FileSystemTierManager(SecondaryTierManager):
  
          self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
  
-+        # This rank's own block directory -- see FileMapper.get_file_name():
-+        # paths are "<base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash>.bin".
-+        # The disk cap only scans/evicts here, never the sibling
-+        # "<base_path>/config.json" one level up.
-+        self._disk_cap_dir = f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
++        # Cap the WHOLE root_dir, not just this run's own block directory.
++        #
++        # FileMapper.base_path is "<root_dir>/<model>_<sha256-of-kv-config>", so
++        # ANY change to the KV cache group layout (layer names, tokens per block
++        # -- e.g. turning the vision tower on with VISION=1, which adds the ViT
++        # layers) mints a brand-new directory and strands the previous one.
++        # Scoping the cap to `<base_path>_r<rank>` therefore capped each config
++        # separately: effective disk usage was N_configs x max_disk_gib, and the
++        # stranded directories were never evicted at all because no running
++        # server ever pointed its cap thread at them.
++        #
++        # That filled a 234 GB NVMe on 2026-08-23: the live config sat correctly
++        # at its 201 GiB cap while a 22 GiB directory orphaned by an earlier
++        # config pushed the filesystem to 100%, and every store failed with
++        # "[Errno 28] No space left on device" while serving continued.
++        #
++        # Scanning root_dir fixes both: the cap becomes a true whole-cache
++        # budget, and orphaned blocks are simply the least-recently-accessed
++        # ones, so they are the first to be evicted. Blocks belonging to another
++        # concurrently-running config can be evicted here -- that costs that
++        # server one ordinary MISS (recompute), never a crash or torn read, the
++        # same guarantee the eviction path already relies on.
++        self._disk_cap_dir = root_dir
 +        self._max_disk_bytes = (
 +            int(max_disk_gib * (1024**3)) if max_disk_gib > 0 else 0
 +        )
@@ -228,7 +246,7 @@ Wired up in micke-start.sh's kv-transfer-config JSON: added
      @override
      def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
          return RequestOffloadingContext()
-@@ -277,5 +404,8 @@
+@@ -277,5 +422,8 @@ class FileSystemTierManager(SecondaryTierManager):
          Shuts down the lookup manager and the thread pool,
          clearing pending tasks and waiting for active threads to complete.
          """
