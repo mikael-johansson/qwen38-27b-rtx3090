@@ -153,12 +153,27 @@ if [ "$SPEC" = "dflash2" ]; then
   MAX_SEQS=${MAX_SEQS:-8}
   # The V2 model runner captures decode graphs in multiples of k+1 tokens: cover MAX_SEQS requests.
   CG=${CG:-$((MAX_SEQS * (DRAFT_TOKENS + 1)))}
-  [ -n "$KV_MEM" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
 else
   MAX_SEQS=${MAX_SEQS:-8}
   SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
   CG=${CG:-32}
 fi
+
+# Pin the KV pool in bytes, for BOTH spec paths (this used to be dflash2-only).
+# gotcha 18: the profiled activation peak varies by ~1 GiB between starts of the
+# same config, so sizing the pool from GPU_UTIL is not reproducible. Pinning
+# bytes is. It also makes co-tenancy arithmetic exact -- measured on this box:
+#
+#   total vLLM footprint = 16330 MiB (weights + graphs + activations, constant)
+#                        + KV_MEM
+#
+# so with something else resident (e.g. whisper.cpp STT at ~700 MiB):
+#
+#   KV_MEM_MiB = 24576 - 16330 - <other resident> - <spike> - <margin>
+#
+# The DeltaNet/GDN prefill spike measured 1208 MiB at 2 concurrent requests with
+# a 40k prefill. 2026-08-27.
+[ -n "$KV_MEM" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
 
 # PREFIX_CACHE=1: reuse the KV of a shared prompt prefix across requests, and resume the
 # recurrent (GDN) state from the last cached block boundary instead of re-running the prompt.
