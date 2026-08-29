@@ -5,7 +5,21 @@ Measured 2026-08-26 .. 2026-08-29 on the RTX 3090 (23.56 GiB usable), MTP path,
 
 [← back to the main README](../README.md) · [gotchas](gotchas.md)
 
-**Result: 158,089 → 188,764 KV tokens (+30,675, +19%)**, with STT running.
+> **CORRECTION 2026-08-29.** The ladder in §2 was measured with a **truncated
+> vLLM command line** — a malformed continuation in `start_qwen.sh` silently
+> dropped every flag after `${ASYNC_ARGS}`, so those runs had no speculative
+> decoding, no prefix caching, no KV offload and no vision args. The pools were
+> larger mostly because those features were absent, and the soaks never
+> exercised the MTP path that gotcha #4 warns about. **Numbers below are being
+> re-measured with the config intact; treat §2 as void until then.** The
+> intact-config figure at 0.97 is **168,913 tokens** (+10,824, +6.8% over
+> 0.93's 158,089), not 188,764.
+>
+> The lesson is in `start-with-whisper.sh`: it now diffs vLLM's "non-default
+> args" line against a required-flag list and refuses to report success if any
+> is missing. `sh -n` passes happily on a truncated-but-valid script.
+
+**Result: 158,089 → 168,913 KV tokens (+10,824, +6.8%)**, with STT running.
 
 ---
 
@@ -29,7 +43,7 @@ available KV by 0.02 GiB (4.92 → 4.94). Raising `GPU_UTIL` moved it immediatel
 `KV_MEM` is still worth setting — it makes the pool reproducible run to run,
 which is #18's actual point — but it is not the capacity lever.
 
-## 2. The ladder
+## 2. The ladder — VOID, see correction above; being re-measured
 
 Worst case per step: **4 concurrent prompts of 48882 / 45705 / 42803 / 39757
 tokens, each generating 12288**, with whisper answering STT continuously.
@@ -142,3 +156,32 @@ later. Judge headroom from a soaked server, not a freshly started one.
   makes that gate *more* permissive. It cannot prevent an OOM at model load.
 - **Shrinking `KV_MEM` to lower the startup peak.** Invariant, see §3.
 - **A restart timer for whisper.** It plateaus; a timer treats a non-problem.
+
+---
+
+## 7. Starting it: `start-with-whisper.sh`
+
+```bash
+./start-with-whisper.sh                  # vLLM then whisper, in order
+GPU_UTIL=0.95 ./start-with-whisper.sh    # lower util
+./start-with-whisper.sh --no-whisper     # vLLM alone
+```
+
+Six steps, each guarding a failure that cost real time here:
+
+1. **stop whisper** — vLLM's `request_memory()` gate needs `GPU_UTIL × total`
+   free, and whisper's ~700 MiB breaks it at 0.97. `micke-start-vision.sh` also
+   preflights this and prints what to do rather than failing cryptically.
+2. **stop vLLM** (TERM then KILL).
+3. **wait for the GPU to drain *and hold steady*** — not merely under a
+   threshold. Gotcha #2: profiling a still-draining card silently undersizes the
+   pool ~25% with no warning.
+4. **clear orphaned `/dev/shm/vllm_offload_*.mmap`** — a killed vLLM leaves a
+   20 GiB segment and the next start dies with `OSError: [Errno 14] Bad address`.
+5. **start vLLM, then VERIFY THE ARG LIST.** A malformed line continuation inside
+   the `exec` drops every later flag; the server still comes up healthy, just
+   without speculative decoding, prefix caching and KV offload. `sh -n` does not
+   catch it. The script diffs the "non-default args" line against a required list
+   and fails loudly. **This check is the most important part of the script** —
+   without it, a day of measurements was invalid and nobody could tell.
+6. **start whisper**, once vLLM is serving.

@@ -1,4 +1,32 @@
 #!/bin/sh
+# Preflight: vLLM's request_memory() gate refuses to start unless
+# free_vram >= GPU_UTIL x total. At GPU_UTIL=0.97 that is 22.85 of 23.56 GiB, so
+# nothing else may hold the card at startup -- whisper's ~700 MiB is enough to
+# fail it, with a vLLM error that does not mention whisper. Say so plainly here.
+_util=${GPU_UTIL:-0.97}
+_free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)
+_tot=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+if [ -n "$_free" ] && [ -n "$_tot" ]; then
+  # vLLM measures against torch's visible total (23.56 GiB = 24125 MiB), which is
+  # ~451 MiB below nvidia-smi's 24576. Match it, or this gate is stricter than the
+  # real one and refuses starts that would have worked.
+  _need=$(awk -v u="$_util" -v t="$_tot" 'BEGIN{printf "%d", u*(t-451)}')
+  if [ "$_free" -lt "$_need" ]; then
+    echo "start: GPU_UTIL=$_util needs ${_need} MiB free, only ${_free} MiB is." >&2
+    nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | sed 's/^/  holding: /' >&2
+    echo "" >&2
+    echo "  If that is whisper-server, stop it, start vLLM, then bring it back:" >&2
+    echo "    systemctl --user stop whisper-server" >&2
+    echo "    sh micke-start-vision.sh" >&2
+    echo "    systemctl --user start whisper-server     # once vLLM is serving" >&2
+    echo "  (whisper-cpp/hermes/start-stack.sh does all three.)" >&2
+    echo "" >&2
+    echo "  Or run with a lower utilisation, which leaves room for it:" >&2
+    echo "    GPU_UTIL=0.95 sh micke-start-vision.sh    # 173,820 tokens instead of 188,764" >&2
+    exit 1
+  fi
+fi
+
 # Vision variant of micke-start.sh. Identical production config, plus:
 #   VISION=1                     build the ViT tower (drops --language-model-only)
 #   VISION_OFFLOAD=prefetch      stream its 27 blocks from pinned host RAM

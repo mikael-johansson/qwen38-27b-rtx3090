@@ -297,6 +297,10 @@ if [ "${VISION:-0}" = "1" ]; then
   esac
 fi
 
+# SPEC=none disables speculative decoding entirely (diagnostic: the MTP drafter's
+# weight-unpack transient dominates the startup peak). Anything else keeps MTP.
+if [ "$SPEC" = "none" ]; then SPEC_ARG=""; else SPEC_ARG="--speculative-config $SPEC_CFG"; fi
+
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
   --host 0.0.0.0 --port $PORT \
@@ -308,9 +312,6 @@ exec venv/bin/vllm serve "$MODEL" \
   $ATTN_ARGS \
   --mamba-ssm-cache-dtype float16 \
   ${ASYNC_ARGS} \
-# SPEC=none disables speculative decoding entirely (diagnostic: the MTP drafter's
-# weight-unpack transient dominates the startup peak). Anything else keeps MTP.
-if [ "$SPEC" = "none" ]; then SPEC_ARG=""; else SPEC_ARG="--speculative-config $SPEC_CFG"; fi
   --max-num-batched-tokens ${MNBT:-2048} \
   ${SPEC_ARG} \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]}" \
