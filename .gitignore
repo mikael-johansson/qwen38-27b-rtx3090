@@ -5,6 +5,7 @@ bench/results/
 models/
 profiles/
 qwen.log
+qwen.log.*
 venv/
 drafter/data/
 drafter/runs/

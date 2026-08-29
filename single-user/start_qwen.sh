@@ -308,8 +308,11 @@ exec venv/bin/vllm serve "$MODEL" \
   $ATTN_ARGS \
   --mamba-ssm-cache-dtype float16 \
   ${ASYNC_ARGS} \
-  --max-num-batched-tokens 2048 \
-  --speculative-config "$SPEC_CFG" \
+# SPEC=none disables speculative decoding entirely (diagnostic: the MTP drafter's
+# weight-unpack transient dominates the startup peak). Anything else keeps MTP.
+if [ "$SPEC" = "none" ]; then SPEC_ARG=""; else SPEC_ARG="--speculative-config $SPEC_CFG"; fi
+  --max-num-batched-tokens ${MNBT:-2048} \
+  ${SPEC_ARG} \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]}" \
   --reasoning-parser qwen3 \
   ${EXTRA_ARGS}
