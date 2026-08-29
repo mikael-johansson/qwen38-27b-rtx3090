@@ -5,23 +5,36 @@ Measured 2026-08-26 .. 2026-08-29 on the RTX 3090 (23.56 GiB usable), MTP path,
 
 [← back to the main README](../README.md) · [gotchas](gotchas.md)
 
-> **CORRECTION 2026-08-29.** The ladder in §2 was measured with a **truncated
-> vLLM command line** — a malformed continuation in `start_qwen.sh` silently
-> dropped every flag after `${ASYNC_ARGS}`, so those runs had no speculative
-> decoding, no prefix caching, no KV offload and no vision args. The pools were
-> larger mostly because those features were absent, and the soaks never
-> exercised the MTP path that gotcha #4 warns about. **Numbers below are being
-> re-measured with the config intact; treat §2 as void until then.** The
-> intact-config figure at 0.97 is **168,913 tokens** (+10,824, +6.8% over
-> 0.93's 158,089), not 188,764.
+> **RETRACTED 2026-08-29.** Everything below §1–§2 in the original version of
+> this document was measured while the vLLM command line was **silently
+> truncated** — a malformed continuation in `start_qwen.sh` dropped every flag
+> after `${ASYNC_ARGS}`, so those runs had no speculative decoding, no prefix
+> caching, no KV offload and no vision args. The larger pools were mostly those
+> features being absent, and no soak ever exercised the MTP path that gotcha #4
+> is about. Re-measured with the config intact, both headline claims are false:
 >
-> The lesson is in `start-with-whisper.sh`: it now diffs vLLM's "non-default
-> args" line against a required-flag list and refuses to report success if any
-> is missing. `sh -n` passes happily on a truncated-but-valid script.
+> | claim | reality with the config intact |
+> |---|---|
+> | "GPU_UTIL is the lever, KV_MEM only caps" | **backwards.** 0.93 and 0.95 both gave 168,913 tokens — GPU_UTIL changed nothing, KV_MEM was the cap |
+> | "0.97 → 188,764 tokens, soak-tested" | 0.97 → 168,913, and it **died** under the worst-case load |
+>
+> The intact config costs ~1.6 GiB more than the crippled one, which is why none
+> of the tuned values survived.
 
-**Result: 158,089 → 168,913 KV tokens (+10,824, +6.8%)**, with STT running.
+**Result, re-measured and verified: `KV_MEM=5606637568` (5347 MiB) →
+146,847 tokens, 1.05x at `MAX_LEN=140000`, with STT running.**
 
----
+Worst case = 4 concurrent prompts of 48882 / 45705 / 42803 / 39757 tokens each
+generating 12288, with whisper answering STT throughout:
+
+| KV pool | at rest | peak | headroom | outcome |
+|---|---|---|---|---|
+| 166,630 tokens *(KV_MEM unset — the original)* | 23030 | 24074 | 502 | **OOM, engine died, 0/4** |
+| **146,847 tokens (`KV_MEM` 5347 MiB)** | **22316** | **23544** | **1032** | **4/4, 0 STT failures, healthy** |
+
+**whisper co-residency costs ~19,800 KV tokens.** That is the real trade, and it
+is a reduction from the original, not a gain. There is no free capacity here:
+the original 166,630-token setting is not safe once whisper holds ~700 MiB.
 
 ## 1. `GPU_UTIL` is what sizes the pool — even when `KV_MEM` is set
 

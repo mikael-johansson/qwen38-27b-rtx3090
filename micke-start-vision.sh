@@ -50,8 +50,8 @@ PREFIX_CACHE=1 \
 CTX=long \
 MAX_LEN=${MAX_LEN:-140000} \
 MAX_SEQS=${MAX_SEQS:-4} \
-KV_MEM=${KV_MEM:-6452936704} \
-GPU_UTIL=${GPU_UTIL:-0.97} \
+KV_MEM=${KV_MEM:-5606637568} \
+GPU_UTIL=${GPU_UTIL:-0.93} \
 PYTHONHASHSEED=0 \
 VLLM_OFFLOAD_EAGLE_FALLBACK=0 \
 VLLM_LOGGING_CONFIG_PATH=$(pwd)/single-user/logging-to-file-debug.json \
@@ -62,35 +62,28 @@ bash single-user/start_qwen.sh
 #
 # --- co-tenancy with whisper.cpp STT (2026-08-27) -------------------------
 #
-# GPU_UTIL=0.97 + KV_MEM=6452936704 -> 188,764 KV tokens (1.35x at MAX_LEN=140000).
+# GPU_UTIL=0.93 (stock) + KV_MEM=5606637568 (5347 MiB) -> 146,847 tokens,
+# 1.05x at MAX_LEN=140000. 2026-08-29.
 #
-# GPU_UTIL is NOT inert when KV_MEM is pinned. vLLM logs "skipped memory
-# profiling" and does not use KV_MEM as the pool size -- it takes
-# min(KV_MEM, what fits in util x total after weights+graphs). So GPU_UTIL is
-# what actually sets the pool, and KV_MEM only caps it. Measured ladder, each
-# step soak-tested with 4 concurrent 39-49k prompts generating 12288 tokens
-# each WITH whisper serving throughout:
+# The pool MUST be capped when whisper.cpp shares the card. Measured with the
+# config intact, worst case = 4 concurrent 39-49k prompts generating 12288 each
+# while whisper served STT:
+#   KV_MEM unset (166,630 tok):  peak 24074 of 24576  -> OOM, engine died, 0/4
+#   KV_MEM 5347  (146,847 tok):  peak 23524           -> 1052 MiB spare, 4/4 OK
+# So whisper co-residency costs ~19,800 KV tokens. That is the real trade.
+# An earlier attempt to raise both was based on measurements taken while the
+# vLLM command line was silently truncated -- see
+# docs/kv-pool-and-whisper-cotenancy.md. With the config intact:
+#   - GPU_UTIL made no difference to the pool (0.93 and 0.95 both gave 168,913
+#     tokens); KV_MEM was the binding cap, the opposite of what the broken-config
+#     runs suggested.
+#   - KV_MEM=6154 MiB left only 462 MiB of headroom and the engine died with
+#     torch.OutOfMemoryError under the worst-case load, at BOTH utilisations.
+# The intact config costs ~1.6 GiB more than the crippled one (MTP drafter,
+# prefix caching, KV offload), which is why the tuned values did not survive.
 #
-#   util   tokens    runtime peak   headroom   result
-#   0.93   158,089   -              -          (previous default)
-#   0.95   173,820   22510          2066       4/4 ok, 0 whisper fail
-#   0.96   180,898   22730          1846       4/4 ok, 0 whisper fail
-#   0.97   188,764   23010          1566       4/4 ok, 0 whisper fail   <- default
-#   0.98   195,842   23190          1386       4/4 ok, 0 whisper fail
-#
-# 0.97 is chosen over 0.98 for margin, not because 0.98 failed: the largest
-# runtime rise ever observed is 1237 MiB, so 0.97 leaves ~330 MiB beyond it and
-# 0.98 only ~150. Set GPU_UTIL=0.98 if you want the extra 7,078 tokens.
-#
-# CAVEAT: a ~25 min soak cannot prove long-term stability. docs/gotchas.md #4
-# warns that this path "survives short benchmarks, which is exactly how it fools
-# you", and the 08-28 illegal-memory-access crash took 38 h to appear. These
-# settings are past the 0.93 that gotcha soak-tested. Revert with GPU_UTIL=0.93.
-#
-# START ORDER: still stop whisper-server before starting vLLM. The startup peak
-# is a ~3 s transient during the MTP drafter's embed/lm_head unpack and it varies
-# 23113-23853 MiB between runs, so the margin against whisper's 724 MiB plateau
-# is not reliable. hermes/start-stack.sh sequences it.
+# Any future tuning must start from ./start-with-whisper.sh, which verifies the
+# argument list before any number is believed.
 #
 # MAX_SEQS=4 (was 8): cuts the transient peak ~288 MiB under concurrent load
 # for 0.5% of the pool. Single-user needs 4 slots.
